@@ -215,3 +215,185 @@ def test_list_symbols_follows_pagination():
         out = data.list_symbols("um")
     assert out == ["AAAUSDT", "BTCUSDT", "ETHUSDT"]
     assert "marker=m1" in seen[1]
+
+
+# ------------------------------------------------------------ fix round 1
+
+TODAY = date(2026, 10, 21)
+
+
+@pytest.fixture(autouse=True)
+def fixed_clock():
+    with mock.patch("judge.data._today_utc", lambda: TODAY):
+        yield
+
+
+def murl(sym, ym, kind="monthly", market="futures/um"):
+    base = f"https://data.binance.vision/data/{market}/{kind}/klines/{sym}"
+    return f"{base}/1d/{sym}-1d-{ym}.zip"
+
+
+def archive(files, extra=None):
+    """fake requests.get: files maps zip url -> csv text; anything else is 404."""
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, **kw):
+        calls.append(url)
+        if extra and url in extra:
+            return extra[url](url, params)
+        base = url[: -len(".CHECKSUM")] if url.endswith(".CHECKSUM") else url
+        if base not in files:
+            return Resp(404)
+        blob = make_zip("f.csv", files[base])
+        return Resp(200, checksum_body(blob) if url != base else blob)
+
+    fake_get.calls = calls
+    return fake_get
+
+
+def month_csv(year, month, days, close0=100.0):
+    rows = [kline_row(f"{year}-{month:02d}-{d:02d}", close0 + d, 10.0 * d) for d in days]
+    return "\n".join([HEADER] + rows)
+
+
+def test_trailing_404_is_end_of_listing_with_last_date(tmp_path):
+    fake = archive({murl("OLDUSDT", "2026-01"): month_csv(2026, 1, range(1, 32))})
+    with mock.patch("judge.data.requests.get", fake):
+        df = data.daily_klines("OLDUSDT", "um", date(2026, 1, 1), date(2026, 4, 30), tmp_path)
+    assert len(df) == 31 and df.index[-1] == pd.Timestamp("2026-01-31")
+    assert df.attrs["last_date"] == pd.Timestamp("2026-01-31")
+
+
+def test_404_between_existing_files_raises(tmp_path):
+    fake = archive({
+        murl("XUSDT", "2026-01"): month_csv(2026, 1, range(1, 32)),
+        murl("XUSDT", "2026-03"): month_csv(2026, 3, range(1, 32)),
+    })
+    with mock.patch("judge.data.requests.get", fake):
+        with pytest.raises(MissingArchiveFile):
+            data.daily_klines("XUSDT", "um", date(2026, 1, 1), date(2026, 3, 31), tmp_path)
+
+
+def test_leading_404_skipped(tmp_path):
+    fake = archive({murl("NEWUSDT", "2026-02"): month_csv(2026, 2, range(1, 29))})
+    with mock.patch("judge.data.requests.get", fake):
+        df = data.daily_klines("NEWUSDT", "um", date(2026, 1, 1), date(2026, 2, 28), tmp_path)
+    assert df.index[0] == pd.Timestamp("2026-02-01") and len(df) == 28
+
+
+def test_all_missing_raises(tmp_path):
+    with mock.patch("judge.data.requests.get", archive({})):
+        with pytest.raises(MissingArchiveFile):
+            data.daily_klines("NOPEUSDT", "um", date(2026, 1, 1), date(2026, 2, 28), tmp_path)
+
+
+def test_current_month_uses_daily_zips_and_unpublished_yesterday_is_end(tmp_path, caplog):
+    files = {murl("BTCUSDT", "2026-09"): month_csv(2026, 9, range(1, 31))}
+    for d in range(1, 20):  # 10-01..10-19; 10-20 (yesterday) not published yet
+        files[murl("BTCUSDT", f"2026-10-{d:02d}", kind="daily")] = month_csv(2026, 10, [d])
+    fake = archive(files)
+    with caplog.at_level(logging.WARNING), mock.patch("judge.data.requests.get", fake):
+        df = data.daily_klines("BTCUSDT", "um", date(2026, 9, 1), date(2026, 10, 20), tmp_path)
+    assert len(df) == 30 + 19 and df.attrs["last_date"] == pd.Timestamp("2026-10-19")
+    assert murl("BTCUSDT", "2026-10-05", kind="daily") in fake.calls
+    assert not any("2026-10.zip" in c for c in fake.calls)
+    assert "not published yet" in caplog.text
+
+
+def test_previous_month_unpublished_early_in_month_falls_back_to_daily(tmp_path):
+    files = {murl("BTCUSDT", "2026-09"): month_csv(2026, 9, range(1, 31))}
+    for d in range(1, 32):
+        files[murl("BTCUSDT", f"2026-10-{d:02d}", kind="daily")] = month_csv(2026, 10, [d])
+    with mock.patch("judge.data._today_utc", lambda: date(2026, 11, 2)), mock.patch(
+        "judge.data.requests.get", archive(files)
+    ):
+        df = data.daily_klines("BTCUSDT", "um", date(2026, 9, 1), date(2026, 10, 31), tmp_path)
+    assert len(df) == 61 and df.attrs["last_date"] == pd.Timestamp("2026-10-31")
+
+
+def test_old_missing_trailing_month_not_treated_as_unpublished(tmp_path, caplog):
+    fake = archive({murl("OLDUSDT", "2026-01"): month_csv(2026, 1, range(1, 32))})
+    with caplog.at_level(logging.WARNING), mock.patch("judge.data.requests.get", fake):
+        data.daily_klines("OLDUSDT", "um", date(2026, 1, 1), date(2026, 2, 28), tmp_path)
+    assert "not published yet" not in caplog.text
+
+
+@pytest.mark.parametrize("status", [451, 503])
+def test_451_retries_503_does_not(tmp_path, status):
+    fake = router({URL: Resp(status), URL + ".CHECKSUM": Resp(status)})
+    sleeps = []
+    with mock.patch("judge.data.requests.get", fake), mock.patch("judge.data.time.sleep", sleeps.append):
+        with pytest.raises(ArchiveFetchError) as ei:
+            data.fetch_file(URL, tmp_path)
+    assert ei.value.status == status
+    assert sleeps == ([2, 8, 30] if status == 451 else [])
+
+
+def test_request_exception_retries_then_succeeds(tmp_path):
+    import requests as rq
+
+    blob = make_zip("f.csv", "a,b\n")
+    state = {"n": 0}
+
+    def fake_get(url, params=None, timeout=None, **kw):
+        if url.endswith(".CHECKSUM"):
+            state["n"] += 1
+            if state["n"] <= 2:
+                raise rq.ConnectionError("boom")
+            return Resp(200, checksum_body(blob))
+        return Resp(200, blob)
+
+    sleeps = []
+    with mock.patch("judge.data.requests.get", fake_get), mock.patch("judge.data.time.sleep", sleeps.append):
+        p = data.fetch_file(URL, tmp_path)
+    assert p.exists() and sleeps == [2, 8]
+
+
+def test_request_exception_exhausted_raises(tmp_path):
+    import requests as rq
+
+    def fake_get(url, params=None, timeout=None, **kw):
+        raise rq.Timeout("slow")
+
+    sleeps = []
+    with mock.patch("judge.data.requests.get", fake_get), mock.patch("judge.data.time.sleep", sleeps.append):
+        with pytest.raises(ArchiveFetchError) as ei:
+            data.fetch_file(URL, tmp_path)
+    assert sleeps == [2, 8, 30] and ei.value.status is None
+
+
+def test_cache_reuse_does_not_redownload_zip(tmp_path):
+    blob = make_zip("f.csv", "a,b\n")
+    fake = router({URL: Resp(200, blob), URL + ".CHECKSUM": Resp(200, checksum_body(blob))})
+    with mock.patch("judge.data.requests.get", fake):
+        data.fetch_file(URL, tmp_path)
+        data.fetch_file(URL, tmp_path)
+    assert fake.calls.count(URL) == 1
+
+
+def test_panel_wide_frames_and_delisted_symbol_tolerated(tmp_path):
+    files = {
+        murl("AUSDT", "2026-01"): month_csv(2026, 1, range(1, 32)),
+        murl("AUSDT", "2026-02"): month_csv(2026, 2, range(1, 29)),
+        murl("DEADUSDT", "2026-01"): month_csv(2026, 1, range(1, 32), close0=5.0),
+    }
+    start, end = date(2026, 1, 1), date(2026, 2, 28)
+    fake = archive(files, extra={"https://fapi.binance.com/fapi/v1/fundingRate": lambda u, p: Resp(200, json_data=[])})
+    with mock.patch("judge.data.requests.get", fake):
+        close, vol, fund = data.panel(["AUSDT", "DEADUSDT"], "um", start, end, tmp_path)
+    assert list(close.columns) == ["AUSDT", "DEADUSDT"] and len(close) == 59
+    assert close.shape == vol.shape == fund.shape
+    assert close["DEADUSDT"].loc["2026-01-31"] == 36.0
+    assert close["DEADUSDT"].loc["2026-02-01":].isna().all()
+    assert close["AUSDT"].notna().all()
+    assert close.attrs["last_date"]["DEADUSDT"] == pd.Timestamp("2026-01-31")
+    assert close.attrs["last_date"]["AUSDT"] == pd.Timestamp("2026-02-28")
+    assert fund["DEADUSDT"].loc["2026-02-01":].isna().all()
+
+
+def test_panel_spot_funding_is_zero(tmp_path):
+    spot = murl("AUSDT", "2026-01", market="spot")
+    fake = archive({spot: month_csv(2026, 1, range(1, 32))})
+    with mock.patch("judge.data.requests.get", fake):
+        close, vol, fund = data.panel(["AUSDT"], "spot", date(2026, 1, 1), date(2026, 1, 31), tmp_path)
+    assert (fund == 0.0).all().all() and fund.shape == close.shape

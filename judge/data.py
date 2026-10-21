@@ -221,37 +221,56 @@ def _kline_url(market: Market, symbol: str, kind: str, stamp: str) -> str:
 def daily_klines(symbol: str, market: Market, start: date, end: date, cache_dir: Path) -> pd.DataFrame:
     """Daily close and quote_volume for [start, end], indexed by UTC date.
 
-    Months before the current one come from monthly zips; the current month
-    from daily zips. Leading months before listing (404) are skipped; any
-    later missing file is a hard failure. Gaps inside the observed span are
-    forward-filled (volume 0) and logged. Data is not extended past the last
-    observed day.
+    Past months come from monthly zips; the current month (and a just-ended
+    month whose monthly zip is not published yet) from daily zips.
+
+    Missing files: leading ones (before listing) are skipped; trailing ones
+    mean end of data (delisting, or not yet published when dated within 2 days
+    of today, which is logged as a warning); a missing file BETWEEN two
+    existing files raises MissingArchiveFile. No data at all also raises.
+    Gaps inside a file span are forward-filled (volume 0) and logged. Data is
+    never extended past the last observed day: later rows do not exist.
+
+    The last observed date is exposed as ``df.attrs["last_date"]`` (Timestamp).
     """
     cache_dir = Path(cache_dir)
     today = _today_utc()
-    frames: list[pd.DataFrame] = []
+    entries: list[tuple[date, str, pd.DataFrame | None]] = []
+
+    def load(url: str, when: date, label: str) -> None:
+        try:
+            entries.append((when, label, _parse_kline_zip(fetch_file(url, cache_dir))))
+        except MissingArchiveFile:
+            entries.append((when, label, None))
+
     for m in _month_starts(start, end):
-        if (m.year, m.month) < (today.year, today.month):
+        month_end = date(m.year + (m.month == 12), m.month % 12 + 1, 1) - timedelta(days=1)
+        use_daily = (m.year, m.month) == (today.year, today.month)
+        if not use_daily:
             url = _kline_url(market, symbol, "monthly", f"{m.year:04d}-{m.month:02d}")
-            try:
-                frames.append(_parse_kline_zip(fetch_file(url, cache_dir)))
-            except MissingArchiveFile:
-                if frames:
-                    raise
-                log.info("%s %s: no archive for %s (before listing)", symbol, market, m)
-        else:
-            last = min(end, today - timedelta(days=1))
-            day = max(start, m)
-            while day <= last:
-                url = _kline_url(market, symbol, "daily", day.isoformat())
-                try:
-                    frames.append(_parse_kline_zip(fetch_file(url, cache_dir)))
-                except MissingArchiveFile:
-                    if frames:
-                        raise
-                day += timedelta(days=1)
-    if not frames:
+            load(url, month_end, url)
+            if entries[-1][2] is not None or month_end < today - timedelta(days=2):
+                continue
+            entries.pop()  # monthly zip not published yet: use daily zips
+            use_daily = True
+        last = min(end, today - timedelta(days=1), month_end)
+        day = max(start, m)
+        while day <= last:
+            load(_kline_url(market, symbol, "daily", day.isoformat()), day, day.isoformat())
+            day += timedelta(days=1)
+
+    loaded = [i for i, e in enumerate(entries) if e[2] is not None]
+    if not loaded:
         raise MissingArchiveFile(f"no kline archive files for {symbol} {market} {start}..{end}")
+    for when, label, frame in entries[loaded[0]: loaded[-1] + 1]:
+        if frame is None:
+            raise MissingArchiveFile(f"missing archive file between existing files: {label}")
+    for when, label, frame in entries[loaded[-1] + 1:]:
+        if when >= today - timedelta(days=2):
+            log.warning("%s %s: %s not published yet; treating as end of data", symbol, market, label)
+        else:
+            log.info("%s %s: %s missing after last data; treating as end of listing", symbol, market, label)
+    frames = [e[2] for e in entries if e[2] is not None]
     df = pd.concat(frames)
     if df.index.has_duplicates:
         dups = sorted({d.date().isoformat() for d in df.index[df.index.duplicated()]})
@@ -259,7 +278,7 @@ def daily_klines(symbol: str, market: Market, start: date, end: date, cache_dir:
     df = df.sort_index()
     df = df.loc[pd.Timestamp(start): pd.Timestamp(end)]
     if df.empty:
-        return df
+        raise MissingArchiveFile(f"{symbol} {market}: no data within {start}..{end}")
     full = pd.date_range(df.index[0], df.index[-1], freq="D", name="date")
     missing = full.difference(df.index)
     for d in missing:
@@ -267,6 +286,7 @@ def daily_klines(symbol: str, market: Market, start: date, end: date, cache_dir:
     df = df.reindex(full)
     df["close"] = df["close"].ffill()
     df["quote_volume"] = df["quote_volume"].fillna(0.0)
+    df.attrs["last_date"] = df.index[-1]
     return df
 
 
@@ -337,21 +357,27 @@ def daily_funding(symbol: str, start: date, end: date, cache_dir: Path) -> pd.Se
 def panel(symbols: list[str], market: Market, start: date, end: date, cache_dir: Path):
     """(close, quote_volume, funding): wide frames, dates x symbols.
 
-    Dates before a symbol's listing or after its data ends are NaN in close
-    and quote_volume. Funding is 0 where absent (always 0 for spot).
+    Dates before a symbol's listing or after its last observed day (delisting)
+    are NaN in all three frames; positions must be closed at the last price.
+    Spot funding is all 0. Per-symbol last observed dates are attached as
+    ``close.attrs["last_date"]``: dict symbol -> Timestamp.
     """
     days = pd.date_range(pd.Timestamp(start), pd.Timestamp(end), freq="D", name="date")
-    closes, vols, funds = {}, {}, {}
+    closes, vols, funds, last_dates = {}, {}, {}, {}
     for sym in symbols:
         k = daily_klines(sym, market, start, end, cache_dir)
         closes[sym] = k["close"]
         vols[sym] = k["quote_volume"]
+        last = k.attrs["last_date"]
+        last_dates[sym] = last
         if market == "um":
-            funds[sym] = daily_funding(sym, start, end, cache_dir)
+            f = daily_funding(sym, start, end, cache_dir)
+            funds[sym] = f.loc[:last]
     close = pd.DataFrame(closes).reindex(days)
     vol = pd.DataFrame(vols).reindex(days)
     if market == "um":
         fund = pd.DataFrame(funds).reindex(days)
     else:
         fund = pd.DataFrame(0.0, index=days, columns=list(symbols))
+    close.attrs["last_date"] = last_dates
     return close, vol, fund
