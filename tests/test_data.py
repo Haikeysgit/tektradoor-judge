@@ -397,3 +397,23 @@ def test_panel_spot_funding_is_zero(tmp_path):
     with mock.patch("judge.data.requests.get", fake):
         close, vol, fund = data.panel(["AUSDT"], "spot", date(2026, 1, 1), date(2026, 1, 31), tmp_path)
     assert (fund == 0.0).all().all() and fund.shape == close.shape
+
+
+def test_panel_skips_symbol_with_no_rows_and_records_it(tmp_path, caplog):
+    files = {murl("AUSDT", "2026-01"): month_csv(2026, 1, range(1, 32))}
+    fake = archive(files, extra={"https://fapi.binance.com/fapi/v1/fundingRate": lambda u, p: Resp(200, json_data=[])})
+    with caplog.at_level(logging.WARNING), mock.patch("judge.data.requests.get", fake):
+        close, vol, fund = data.panel(["AUSDT", "NOPEUSDT"], "um", date(2026, 1, 1), date(2026, 1, 31), tmp_path)
+    assert list(close.columns) == list(vol.columns) == list(fund.columns) == ["AUSDT"]
+    assert close.attrs["skipped"] == ["NOPEUSDT"]
+    assert "NOPEUSDT" in caplog.text
+
+
+def test_panel_still_raises_on_gap_between_files(tmp_path):
+    fake = archive({
+        murl("XUSDT", "2026-01"): month_csv(2026, 1, range(1, 32)),
+        murl("XUSDT", "2026-03"): month_csv(2026, 3, range(1, 32)),
+    })
+    with mock.patch("judge.data.requests.get", fake):
+        with pytest.raises(MissingArchiveFile):
+            data.panel(["XUSDT"], "um", date(2026, 1, 1), date(2026, 3, 31), tmp_path)

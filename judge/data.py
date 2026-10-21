@@ -34,6 +34,10 @@ class MissingArchiveFile(Exception):
     """The archive has no file at this URL (HTTP 404)."""
 
 
+class NoDataInWindow(MissingArchiveFile):
+    """A symbol has no archive rows at all inside the requested window."""
+
+
 class ChecksumMismatch(Exception):
     """Downloaded file does not match its .CHECKSUM, even after one re-download."""
 
@@ -261,7 +265,7 @@ def daily_klines(symbol: str, market: Market, start: date, end: date, cache_dir:
 
     loaded = [i for i, e in enumerate(entries) if e[2] is not None]
     if not loaded:
-        raise MissingArchiveFile(f"no kline archive files for {symbol} {market} {start}..{end}")
+        raise NoDataInWindow(f"no kline archive files for {symbol} {market} {start}..{end}")
     for when, label, frame in entries[loaded[0]: loaded[-1] + 1]:
         if frame is None:
             raise MissingArchiveFile(f"missing archive file between existing files: {label}")
@@ -278,7 +282,7 @@ def daily_klines(symbol: str, market: Market, start: date, end: date, cache_dir:
     df = df.sort_index()
     df = df.loc[pd.Timestamp(start): pd.Timestamp(end)]
     if df.empty:
-        raise MissingArchiveFile(f"{symbol} {market}: no data within {start}..{end}")
+        raise NoDataInWindow(f"{symbol} {market}: no data within {start}..{end}")
     full = pd.date_range(df.index[0], df.index[-1], freq="D", name="date")
     missing = full.difference(df.index)
     for d in missing:
@@ -361,11 +365,20 @@ def panel(symbols: list[str], market: Market, start: date, end: date, cache_dir:
     are NaN in all three frames; positions must be closed at the last price.
     Spot funding is all 0. Per-symbol last observed dates are attached as
     ``close.attrs["last_date"]``: dict symbol -> Timestamp.
+
+    A symbol with no rows at all in the window is skipped with a warning: it is
+    left out of all three frames and listed in ``close.attrs["skipped"]``. A gap
+    between existing files is still a hard failure.
     """
     days = pd.date_range(pd.Timestamp(start), pd.Timestamp(end), freq="D", name="date")
-    closes, vols, funds, last_dates = {}, {}, {}, {}
+    closes, vols, funds, last_dates, skipped = {}, {}, {}, {}, []
     for sym in symbols:
-        k = daily_klines(sym, market, start, end, cache_dir)
+        try:
+            k = daily_klines(sym, market, start, end, cache_dir)
+        except NoDataInWindow as exc:
+            log.warning("skipping %s: %s", sym, exc)
+            skipped.append(sym)
+            continue
         closes[sym] = k["close"]
         vols[sym] = k["quote_volume"]
         last = k.attrs["last_date"]
@@ -373,11 +386,82 @@ def panel(symbols: list[str], market: Market, start: date, end: date, cache_dir:
         if market == "um":
             f = daily_funding(sym, start, end, cache_dir)
             funds[sym] = f.loc[:last]
-    close = pd.DataFrame(closes).reindex(days)
-    vol = pd.DataFrame(vols).reindex(days)
+    kept = [s for s in symbols if s not in skipped]
+    close = pd.DataFrame(closes, columns=kept).reindex(days)
+    vol = pd.DataFrame(vols, columns=kept).reindex(days)
     if market == "um":
-        fund = pd.DataFrame(funds).reindex(days)
+        fund = pd.DataFrame(funds, columns=kept).reindex(days)
     else:
-        fund = pd.DataFrame(0.0, index=days, columns=list(symbols))
+        fund = pd.DataFrame(0.0, index=days, columns=kept)
     close.attrs["last_date"] = last_dates
+    close.attrs["skipped"] = skipped
     return close, vol, fund
+
+
+# ---------------------------------------------------------------- universe
+
+EXCLUDED_BASES = frozenset({
+    "USDC", "BUSD", "TUSD", "USDP", "FDUSD", "DAI", "USDE", "PYUSD", "EUR", "EURI",
+    "AEUR", "GBP", "WBTC", "WBETH", "BFUSD", "USD1", "XUSD",
+})
+QUOTE_SUFFIXES = ("USDT", "USDC", "FDUSD")
+VOLUME_WINDOW = 30
+EXIT_MIN_MEDIAN_VOLUME = 1_000_000
+EXIT_MIN_MEDIAN_ABS_CHANGE = 0.005
+
+
+def base_asset(symbol: str) -> str:
+    """BTCUSDT -> BTC. A multiplier prefix such as 1000 stays part of the name."""
+    for q in QUOTE_SUFFIXES:
+        if symbol.endswith(q) and len(symbol) > len(q):
+            return symbol[: -len(q)]
+    return symbol
+
+
+def _day_ts(day: date) -> pd.Timestamp:
+    return pd.Timestamp(day)
+
+
+def top_universe(
+    close: pd.DataFrame,
+    quote_volume: pd.DataFrame,
+    month_end: date,
+    size: int = 20,
+    min_age_days: int = 365,
+    min_median_volume: float = 2_000_000,
+) -> list[str]:
+    """Paper 7.1: the month's tradable coins, ranked by 30-day median quote volume.
+
+    Kept: a close on month_end (not delisted), at least min_age_days non-NaN
+    closes up to month_end, 30-day median quote volume >= min_median_volume,
+    and a base asset outside the fixed stable/wrapped exclusion list. Ties
+    rank by symbol name.
+    """
+    ts = _day_ts(month_end)
+    if ts not in close.index:
+        raise ValueError(f"{month_end} is not in the close index")
+    hist = close.loc[:ts]
+    age = hist.notna().sum()
+    median_vol = quote_volume.loc[:ts].tail(VOLUME_WINDOW).median()
+    alive = hist.loc[ts].notna()
+    ok = alive & (age >= min_age_days) & (median_vol >= min_median_volume)
+    ok &= pd.Series({s: base_asset(s) not in EXCLUDED_BASES for s in close.columns})
+    ranked = sorted(ok.index[ok], key=lambda s: (-median_vol[s], s))
+    return ranked[:size]
+
+
+def exit_flags(close: pd.DataFrame, quote_volume: pd.DataFrame, day: date) -> list[str]:
+    """Coins to drop from tomorrow: stale or illiquid over the 30 days ending day.
+
+    Flagged when the 30-day median quote volume is below $1M, or the 30-day
+    median absolute daily price change is below 0.5%. Checked daily. Coins
+    with no data on day (delisted or not yet listed) are not flagged here.
+    """
+    ts = _day_ts(day)
+    if ts not in close.index:
+        raise ValueError(f"{day} is not in the close index")
+    median_vol = quote_volume.loc[:ts].tail(VOLUME_WINDOW).median()
+    median_chg = close.loc[:ts].pct_change(fill_method=None).abs().tail(VOLUME_WINDOW).median()
+    alive = close.loc[ts].notna()
+    flagged = alive & ((median_vol < EXIT_MIN_MEDIAN_VOLUME) | (median_chg < EXIT_MIN_MEDIAN_ABS_CHANGE))
+    return [s for s in close.columns if flagged[s]]
