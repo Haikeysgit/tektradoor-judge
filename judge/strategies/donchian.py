@@ -150,6 +150,68 @@ def _excluded_mask(index: pd.DatetimeIndex, columns: list, excluded) -> pd.DataF
     return mask
 
 
+def _flipped(mask: pd.DataFrame) -> pd.DataFrame:
+    return mask != mask.shift(fill_value=False)
+
+
+def _allocation_frame(close: pd.DataFrame, universe_by_month, excluded):
+    """(active mask, universe size per day, allocation signal_changed flags).
+
+    Depends only on close, universe and exclusions, so callers that allocate
+    many weight sets over the same coins (luck odds) compute it once.
+    """
+    idx, cols = close.index, list(close.columns)
+    member = _universe_mask(idx, cols, universe_by_month)
+    excl = _excluded_mask(idx, cols, excluded)
+    delisted = (close.notna().cummax() & close.isna()).cummax()
+    size = member.sum(axis=1).replace(0, np.nan)
+    active = member & ~excl & ~delisted
+    flags = (_flipped(member) | _flipped(excl) | _flipped(delisted)).astype(bool)
+    return active, size, flags
+
+
+def _apply_allocation(coin_weights: pd.DataFrame, active, size, gross_cap: float | None) -> pd.DataFrame:
+    weights = coin_weights.where(active, 0.0).div(size, axis=0).fillna(0.0)
+    if gross_cap is not None:
+        gross = weights.abs().sum(axis=1)
+        factor = (gross_cap / gross).where(gross > gross_cap, 1.0)
+        weights = weights.mul(factor, axis=0)
+    return weights
+
+
+def allocate(
+    coin_weights: pd.DataFrame,
+    close: pd.DataFrame,
+    universe_by_month: dict[date, list[str]],
+    gross_cap: float | None,
+    excluded: dict[date, set[str]] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Portfolio allocation of per-coin weights (by decision date).
+
+    coin_weights must share close's index and columns.
+    universe_by_month: keyed by the month-end date of selection, i.e. the
+        output of top_universe(close, qv, month_end). That list applies to
+        every day of the NEXT month. A month whose previous month end has no
+        key is flat.
+    excluded: day -> coins flagged by exit_flags(close, qv, day). An excluded
+        coin gets weight 0 in that day's decision, so it is out of tomorrow's
+        return (exit_flags' "drop from tomorrow").
+
+    weight[t, coin] = coin_weights[t] / len(month universe) for members, else 0.
+    A coin counts as delisted from its first NaN close after its first valid
+    close and gets weight 0 from that day on. If gross_cap is set and
+    sum(|w|) on a day exceeds it, that day's weights scale down proportionally.
+
+    signal_changed[t, coin] is True when the coin entered or left the
+    universe, its exclusion started or ended, or it delisted that day. Before
+    the first row everything counts as outside the universe, not excluded and
+    not delisted.
+    """
+    coin_weights = coin_weights.reindex(index=close.index, columns=close.columns).fillna(0.0)
+    active, size, flags = _allocation_frame(close, universe_by_month, excluded)
+    return _apply_allocation(coin_weights, active, size, gross_cap), flags
+
+
 def portfolio_weights(
     close: pd.DataFrame,
     universe_by_month: dict[date, list[str]],
@@ -163,45 +225,16 @@ def portfolio_weights(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Daily portfolio weights (by decision date) and signal_changed flags.
 
-    universe_by_month: keyed by the month-end date of selection, i.e. the
-        output of top_universe(close, qv, month_end). That list applies to
-        every day of the NEXT month. A month whose previous month end has no
-        key is flat.
-    excluded: day -> coins flagged by exit_flags(close, qv, day). An excluded
-        coin gets weight 0 in that day's decision, so it is out of tomorrow's
-        return (exit_flags' "drop from tomorrow").
-
-    weight[t, coin] = coin_weight[t] / len(month universe) for members, else 0.
-    A coin counts as delisted from its first NaN close after its first valid
-    close and gets weight 0 from that day on. If gross_cap is set and
-    sum(|w|) on a day exceeds it, that day's weights scale down proportionally.
-
-    signal_changed[t, coin] is True when any lookback's position changed at t,
-    the coin entered or left the universe, its exclusion started or ended, or
-    it delisted that day. Before the first row everything counts as flat,
-    outside the universe, not excluded and not delisted.
+    Allocation (universe, exclusions, delisting, gross cap) is ``allocate``.
+    signal_changed is allocate's flags OR any lookback's position changing
+    at t (before the first row every lookback counts as flat).
     """
     idx, cols = close.index, list(close.columns)
-    member = _universe_mask(idx, cols, universe_by_month)
-    excl = _excluded_mask(idx, cols, excluded)
-    delisted = (close.notna().cummax() & close.isna()).cummax()
-
     coin_w = pd.DataFrame(0.0, index=idx, columns=cols)
     pos_chg = pd.DataFrame(False, index=idx, columns=cols)
     for c in cols:
         coin_w[c], pos_chg[c] = _coin_frames(close[c], long_short, lookbacks, vol_target, vol_window, per_coin_cap)
 
-    size = member.sum(axis=1).replace(0, np.nan)
-    active = member & ~excl & ~delisted
-    weights = coin_w.where(active, 0.0).div(size, axis=0).fillna(0.0)
-
-    if gross_cap is not None:
-        gross = weights.abs().sum(axis=1)
-        factor = (gross_cap / gross).where(gross > gross_cap, 1.0)
-        weights = weights.mul(factor, axis=0)
-
-    def flipped(mask: pd.DataFrame) -> pd.DataFrame:
-        return mask != mask.shift(fill_value=False)
-
-    signal_changed = pos_chg | flipped(member) | flipped(excl) | flipped(delisted)
+    weights, alloc_chg = allocate(coin_w, close, universe_by_month, gross_cap, excluded)
+    signal_changed = pos_chg | alloc_chg
     return weights, signal_changed.astype(bool)
