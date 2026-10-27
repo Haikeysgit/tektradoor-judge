@@ -206,3 +206,85 @@ def test_luck_odds_in_unit_interval():
     # flip_prob 0: never leaves state 0, so flat; Sharpe 0 never passes.
     assert luck_odds(close, funding, uni, long_short=False, flip_prob=0.0, n_sims=10, seed=1,
                      kind="test", cost_per_side=C, gross_cap=1.0) == 0.0
+
+
+# ---------------------------------------------------------------- luck odds fairness (Task 7 ruling 2)
+
+from datetime import date  # noqa: E402
+
+from judge.judge import luck_sims  # noqa: E402
+
+
+def _sims(**over):
+    close, funding, uni = _luck_inputs()
+    kw = dict(long_short=True, flip_prob=0.05, n_sims=6, seed=3, cost_per_side=C, gross_cap=1.0)
+    kw.update(over)
+    return luck_sims(close, funding, uni, **kw)
+
+
+def test_luck_threshold_reduces_sim_turnover_cost():
+    def drag(threshold):
+        gross = _sims(cost_per_side=0.0, rebalance_threshold=threshold, flip_prob=0.01)
+        net = _sims(cost_per_side=C, rebalance_threshold=threshold, flip_prob=0.01)
+        return float(np.mean([(g - n).sum() for g, n in zip(gross, net)]))
+
+    assert drag(None) > 0
+    assert drag(0.2) < 0.9 * drag(None)
+
+
+def test_luck_window_changes_scored_length():
+    full = _sims()
+    assert len(full[0]) == len(DAYS) - 1
+    win = (date(2024, 7, 1), date(2024, 9, 30))
+    sliced = _sims(window=win)
+    assert len(sliced[0]) == (win[1] - win[0]).days + 1
+    assert sliced[0].index[0] == pd.Timestamp("2024-07-01")
+    assert sliced[0].index[-1] == pd.Timestamp("2024-09-30")
+    # Benchmark is scored on the same days.
+    close, funding, uni = _luck_inputs()
+    b = benchmark_returns(close, funding, uni, C, window=win)
+    assert b.index.equals(sliced[0].index)
+    # Book starts flat: the first trades fill at the close before the window's
+    # first day (00:00 UTC on it); no position is held before that.
+    w = _sims(window=win, return_weights=True)[0]
+    assert (w.loc[:"2024-06-29"] == 0).all().all()
+    assert (w.loc["2024-06-30":] != 0).any().any()
+
+
+def test_luck_sims_average_one_path_per_lookback():
+    close, _, uni = _luck_inputs()
+    lbs = (5, 10, 20, 30, 60, 90, 150, 250, 360)
+    states = luck_sims(close, None, uni, long_short=False, flip_prob=0.3, n_sims=1, seed=1, cost_per_side=0.0,
+                       gross_cap=None, lookbacks=lbs, return_states=True)[0]
+    vals = np.unique(np.round(states.to_numpy() * len(lbs), 9))
+    assert set(vals) <= set(range(len(lbs) + 1))
+    assert len(vals) > 2  # a mean of paths, not all-or-nothing
+
+
+def test_luck_sims_use_candidate_caps_and_exclusions():
+    close, _, uni = _luck_inputs()
+    col = close.columns[0]
+    excluded = {pd.Timestamp(d).date(): {col} for d in pd.date_range("2024-05-01", "2024-05-31")}
+    kw = dict(long_short=False, flip_prob=0.2, n_sims=3, seed=5, cost_per_side=0.0, gross_cap=None)
+    a = luck_sims(close, None, uni, excluded=excluded, return_weights=True, **kw)
+    b = luck_sims(close, None, uni, per_coin_cap=0.1, vol_target=0.5, vol_window=30, return_weights=True, **kw)
+    assert (a[0].loc["2024-05-01":"2024-05-31", col] == 0).all()
+    assert (b[0].abs() <= 0.1 / close.shape[1] + 1e-12).all().all()
+
+
+def test_luck_odds_deterministic_with_new_settings():
+    close, funding, uni = _luck_inputs()
+    excluded = {date(2024, 5, 3): {close.columns[0]}}
+    kw = dict(long_short=True, flip_prob=0.05, n_sims=5, seed=9, cost_per_side=C, gross_cap=1.0,
+              rebalance_threshold=0.2, per_coin_cap=1.5, vol_target=0.3, vol_window=30,
+              excluded=excluded, window=(date(2024, 6, 1), date(2024, 12, 31)))
+    a, b = luck_sims(close, funding, uni, **kw), luck_sims(close, funding, uni, **kw)
+    for x, y in zip(a, b):
+        pd.testing.assert_series_equal(x, y)
+    other = luck_sims(close, funding, uni, **{**kw, "seed": 10})
+    assert not all(x.equals(y) for x, y in zip(a, other))
+    odds_kw = {k: v for k, v in kw.items() if k != "n_sims"}
+    p = luck_odds(close, funding, uni, kind="test", n_sims=20, **odds_kw)
+    assert p == luck_odds(close, funding, uni, kind="test", n_sims=20, **odds_kw)
+    bench = benchmark_returns(close, funding, uni, C, excluded=excluded, window=kw["window"])
+    assert luck_odds(close, funding, uni, kind="test", n_sims=20, bench=bench, **odds_kw) == p

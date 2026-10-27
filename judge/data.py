@@ -11,6 +11,7 @@ import logging
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -95,18 +96,60 @@ def _expected_sha(text: str, url: str) -> str:
     return parts[0].lower()
 
 
+_fetch_recorders: list[list[Path]] = []
+
+
+@contextmanager
+def record_fetches():
+    """Collect the cached path of every file fetch_file verifies in the block.
+
+    The judge reads each path's .CHECKSUM sidecar (checksum_path) into the
+    result manifest.
+    """
+    rec: list[Path] = []
+    _fetch_recorders.append(rec)
+    try:
+        yield rec
+    finally:
+        _fetch_recorders[:] = [r for r in _fetch_recorders if r is not rec]
+
+
+def note_fetch(path: Path) -> None:
+    """Report a verified cached file to every active record_fetches block."""
+    for rec in _fetch_recorders:
+        rec.append(Path(path))
+
+
+def checksum_path(path: Path) -> Path:
+    """The cached copy of a file's archive .CHECKSUM, next to the file."""
+    path = Path(path)
+    return path.with_name(path.name + ".CHECKSUM")
+
+
+def _verified(path: Path, checksum_text: str) -> Path:
+    side = checksum_path(path)
+    blob = checksum_text.encode("utf-8")
+    if not side.exists() or side.read_bytes() != blob:
+        side.write_bytes(blob)
+    note_fetch(path)
+    return path
+
+
 def fetch_file(url: str, cache_dir: Path) -> Path:
     """Download url (+ .CHECKSUM), verify sha256, return the cached path.
 
     On mismatch re-downloads once, then raises ChecksumMismatch. A cached file
-    is trusted only if it still matches its freshly fetched checksum.
+    is trusted only if it still matches its freshly fetched checksum. The
+    verified .CHECKSUM text is kept next to the file (checksum_path) and the
+    path is reported to record_fetches.
     """
     path = _local_path(url, Path(cache_dir))
     path.parent.mkdir(parents=True, exist_ok=True)
-    expected = _expected_sha(_http_get(url + ".CHECKSUM").text, url)
+    checksum_text = _http_get(url + ".CHECKSUM").text
+    expected = _expected_sha(checksum_text, url)
 
     if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() == expected:
-        return path
+        return _verified(path, checksum_text)
 
     actual = ""
     for attempt in (1, 2):
@@ -116,10 +159,11 @@ def fetch_file(url: str, cache_dir: Path) -> Path:
             tmp = path.with_suffix(path.suffix + ".part")
             tmp.write_bytes(blob)
             tmp.replace(path)
-            return path
+            return _verified(path, checksum_text)
         log.warning("checksum mismatch for %s (download %d)", url, attempt)
         if attempt == 1:
-            expected = _expected_sha(_http_get(url + ".CHECKSUM").text, url)
+            checksum_text = _http_get(url + ".CHECKSUM").text
+            expected = _expected_sha(checksum_text, url)
     path.unlink(missing_ok=True)
     raise ChecksumMismatch(f"{url}: expected {expected}, got {actual}")
 
