@@ -3,6 +3,7 @@
     python -m judge run prereg/NN-name.json --kind test
     python -m judge open-final prereg/NN-name.json      # Final step 1
     python -m judge run prereg/NN-name.json --kind final|final_alone   # step 2
+    python -m judge reproduce prereg/drafts/NN-name.json  # paper reproduction
 
 Final is two steps. ``open-final`` runs every Final gate check, writes
 results/NN-name.final_opened (prereg sha256, judge tree hash, window) and
@@ -13,7 +14,11 @@ before it loads any Final data. A failed Final run can simply be rerun.
 Exit codes for run: 0 the run completed and passed, 1 it completed and did not
 pass (the result file is written either way), 2 the judge refused (integrity,
 window, Final gate, existing result), 3 a data error. open-final: 0 marker
-written, 2 refused.
+written, 2 refused. reproduce: 0 every check passed, 1 completed and failed
+(the result file is written either way), 2 refused, 3 a data error.
+
+Test (and Final-alone) need a committed, passing results/NN-name-repro.json
+whose strategy_sha256 matches the prereg's rules.
 
 stamp_confirmed (needed for Final) comes only from the committed companion
 file prereg/NN-name.stamp_confirmed (one ISO date line, one commit).
@@ -29,7 +34,10 @@ from datetime import date
 from pathlib import Path
 
 from judge import data
-from judge.judge import KINDS, JudgeRefusal, prepare_final, run
+from judge import judge as J
+from judge.judge import KINDS, JudgeRefusal, prepare_final, reproduce, run
+
+DATA_ERRORS = (data.MissingArchiveFile, data.ChecksumMismatch, data.ArchiveFetchError, data.DataIntegrityError)
 
 
 def _iso_date(text: str) -> date:
@@ -57,7 +65,26 @@ def main(argv: list[str] | None = None) -> int:
     o = sub.add_parser("open-final", help="Final step 1: gate checks, write the marker to commit; loads no data")
     o.add_argument("prereg", type=Path, help="prereg/NN-name.json")
     _stamp_arg(o)
+    rp = sub.add_parser("reproduce", help="reproduce the paper's single-asset Sharpe ratios for a prereg draft")
+    rp.add_argument("prereg", type=Path, help="prereg/drafts/NN-name.json")
+    rp.add_argument("--cache-dir", type=Path, default=None, help="API response cache (default: <repo>/data_cache/repro)")
     args = parser.parse_args(argv)
+
+    if args.command == "reproduce":
+        try:
+            res = reproduce(args.prereg, loader=J.exchange_daily, cache_dir=args.cache_dir)
+        except JudgeRefusal as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 2
+        except DATA_ERRORS as exc:
+            print(f"data error: {exc}", file=sys.stderr)
+            return 3
+        print(f"{'PASSED' if res['passed'] else 'FAILED'} {res['candidate_id']} repro (max rel_error {res['max_rel_error']})")
+        print(f"{'check':<22} {'target':>7} {'ours':>8} {'rel_error':>10}  passed")
+        for name, c in res["checks"].items():
+            print(f"{name:<22} {c['target']:>7.2f} {c['ours']:>8.4f} {c['rel_error']:>10.4f}  {c['passed']}")
+        print(f"wrote {Path(J.CODE_ROOT) / 'results' / (res['candidate_id'] + '-repro.json')}")
+        return 0 if res["passed"] else 1
 
     if args.command == "open-final":
         try:
@@ -75,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     except JudgeRefusal as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
-    except (data.MissingArchiveFile, data.ChecksumMismatch, data.ArchiveFetchError, data.DataIntegrityError) as exc:
+    except DATA_ERRORS as exc:
         print(f"data error: {exc}", file=sys.stderr)
         return 3
     res = json.loads(out.read_text(encoding="utf-8"))

@@ -104,6 +104,17 @@ def _commit_test_result(repo: Path, p: Path, passed=True, **manifest_over) -> Pa
     return out
 
 
+def _commit_repro_pass(repo: Path, p: Path) -> Path:
+    """A committed, passing reproduction of p's rules (Task 8 gate for Test runs)."""
+    params = load_prereg(p)
+    out = repo / "results" / f"{params['candidate_id']}-repro.json"
+    rec = {"candidate_id": params["candidate_id"], "kind": "repro", "passed": True,
+           "strategy_sha256": J.strategy_sha256(params)}
+    _write_bytes(out, json.dumps(rec) + "\n")
+    _commit(repo, "repro result")
+    return out
+
+
 def _gate_kw(repo: Path, p: Path, **over) -> dict:
     kw = dict(
         prereg_sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
@@ -603,6 +614,7 @@ def _fake_loader(drift, calls, seed=0):
 
 def test_failed_run_still_writes_result_file(repo, monkeypatch):
     p = _register(repo)
+    _commit_repro_pass(repo, p)
     calls = []
     monkeypatch.setattr(J, "_load_data", _fake_loader(drift=-0.004, calls=calls))
     out = run(p, "test")
@@ -615,6 +627,7 @@ def test_failed_run_still_writes_result_file(repo, monkeypatch):
 
 def test_run_writes_result_with_manifest(repo, monkeypatch):
     p = _register(repo)
+    _commit_repro_pass(repo, p)
     monkeypatch.setattr(J, "_load_data", _fake_loader(drift=0.003, calls=[]))
     out = run(p, "test")
     res = json.loads(out.read_text())
@@ -657,6 +670,7 @@ def test_run_writes_result_with_manifest(repo, monkeypatch):
 
 def test_run_refuses_when_data_short_of_window(repo, monkeypatch):
     p = _register(repo)
+    _commit_repro_pass(repo, p)
 
     def short(market, start, end, cache_dir):
         return _synthetic(start, end - timedelta(days=5))
@@ -702,6 +716,7 @@ def test_cli_open_final_writes_marker_and_stops(repo, monkeypatch, capsys):
 
 def test_cli_test_run_reports_and_exit_code(repo, monkeypatch, capsys):
     p = _register(repo)
+    _commit_repro_pass(repo, p)
     monkeypatch.setattr(J, "_load_data", _fake_loader(drift=-0.004, calls=[]))
     assert cli_main(["run", str(p), "--kind", "test"]) == 1  # completed, did not pass
     out = capsys.readouterr().out

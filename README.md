@@ -7,6 +7,9 @@ The repository is private. The public proof is the sha256 of each prereg file, p
 ## Running a candidate
 
 ```
+python -m judge reproduce prereg/drafts/01-name.json   # paper reproduction, before registering
+git add results/ && git commit            # commit results/01-name-repro.json
+
 python -m judge run prereg/01-name.json --kind test
 git add results/ && git commit            # commit the Test result
 
@@ -15,6 +18,8 @@ git add results/ && git commit            # commit results/01-name.final_opened
 python -m judge run prereg/01-name.json --kind final   # Final step 2 (final_alone if the Test window is under 12 months)
 git add results/ && git commit            # commit the Final result
 ```
+
+`reproduce` first checks that the judge reproduces the paper's own single-asset Sharpe ratios with the paper's own costs (10 bps per side, 20% rebalance threshold, 200% per-coin cap, spot prices from Bitstamp and Poloniex). Every check must land within 20% of the paper's number. It writes `results/{candidate_id}-repro.json`, pass or fail, never overwritten. `run --kind test` (and `final_alone`) refuses unless that file is committed, says `passed: true`, and its `strategy_sha256` matches the prereg's rules (`long_short`, `lookbacks`, `vol_target`, `vol_window`, `per_coin_cap_repro`). A failed reproduction is not tuned: the candidate stops there.
 
 Each run writes `results/{candidate_id}-{kind}.json`, pass or fail, with a manifest (archive checksums, prereg sha256, judge tree hash, seed, `pip freeze`, run time). Results are never overwritten. `results/` is committed: it is the record, so it is deliberately not gitignored.
 

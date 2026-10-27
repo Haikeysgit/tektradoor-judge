@@ -423,6 +423,10 @@ class ResultExists(JudgeRefusal):
     """A result file for this candidate and kind already exists; never overwritten."""
 
 
+class ReproGateError(JudgeRefusal):
+    """Test (or Final-alone) needs a committed, passing reproduction of the same strategy."""
+
+
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
@@ -477,6 +481,15 @@ def load_prereg(path: Path) -> dict:
         raise PreregError(f"{path.name}: missing required key(s): {', '.join(missing)}")
     _validate(raw, path.name)
     return raw
+
+
+def load_prereg_params(path: Path) -> dict:
+    """Read a prereg draft (prereg/drafts/NN-name.json) for reproduction.
+
+    The same key and type validation as load_prereg, and NO integrity check:
+    a draft is not registered yet and cannot carry the final judge_tree_hash.
+    """
+    return load_prereg(path)
 
 
 def _paper_end(prereg: dict, name: str = "prereg") -> date:
@@ -885,20 +898,250 @@ def _final_context(path: Path, prereg: dict, kind: Kind, stamp_flag: date | None
 def prepare_final(prereg_path: Path, *, stamp_confirmed: date | None = None, results_dir: Path | None = None) -> Path:
     """``python -m judge open-final``: every Final gate check, then write the
     marker and stop. Loads no data. The kind (final or final_alone) follows
-    from the candidate's Test window. The window's data need not exist yet."""
+    from the candidate's Test window. The window's data need not exist yet.
+    A Final-alone candidate (no Test) also needs its reproduction pass."""
     path = Path(prereg_path).resolve()
     prereg = load_prereg(path)
     check_integrity(path)
     root = _repo_root(path.parent)
     if root != Path(CODE_ROOT).resolve():
         raise PreregMismatch(f"judge code runs from {Path(CODE_ROOT).resolve()} but {path.name} is in {root}")
+    rd = Path(results_dir) if results_dir is not None else root / "results"
     kind = "final_alone" if is_final_alone(prereg) else "final"
     _, _, win = _final_context(path, prereg, kind, stamp_confirmed, latest_data_date=date.max)
+    if kind == "final_alone":
+        check_repro_pass(root, rd, prereg)
     return open_final(
         prereg["candidate_id"], prereg_sha256=committed_sha256(path), judge_tree_hash=_git(root, "rev-parse", "HEAD:judge"),
-        window=win, final_alone=kind == "final_alone",
-        results_dir=Path(results_dir) if results_dir is not None else root / "results",
+        window=win, final_alone=kind == "final_alone", results_dir=rd,
     )
+
+
+# ---------------------------------------------------------------- reproduction (Task 8)
+#
+# Before a candidate is judged, the judge must reproduce the paper's own
+# single-asset Sharpe ratios with the paper's own costs (REPRO). A miss of more
+# than REPRO_MAX_REL_ERROR on any check fails the reproduction; nobody tunes.
+
+exchange_daily = data.exchange_daily  # the default reproduction price loader
+
+REPRO_MAX_REL_ERROR = 0.20
+REPRO_SAMPLE_END = date(2025, 3, 19)  # SSRN 5209907 sample end
+REPRO_START = {"BTC": date(2015, 1, 1), "ETH": date(2015, 8, 8)}
+REPRO_PERIOD_NOTES = {
+    "BTC": "2015-01-01..2025-03-19, as the paper",
+    "ETH": "starts 2015-08-08 (Poloniex listing), paper 2015-08-01",
+}
+REPRO_SOURCES = {
+    "BTC": f"Bitstamp btcusd daily close, candle opening 00:00 UTC ({data.BITSTAMP_OHLC})",
+    "ETH": f"Poloniex ETH_BTC DAY_1 close ({data.POLONIEX_CANDLES}) x Bitstamp btcusd close, same UTC day",
+}
+# (name, asset, long_short, gross of costs, paper Sharpe, paper table)
+REPRO_LONG_ONLY_CHECKS = (
+    ("btc_long_only_net", "BTC", False, False, 1.56, "Table 3"),
+    ("eth_long_only_net", "ETH", False, False, 1.51, "Table 3"),
+)
+REPRO_LONG_SHORT_CHECKS = (
+    ("btc_long_short_gross", "BTC", True, True, 1.31, "Table 5 Combo"),
+)
+
+
+def strategy_canonical(params: dict) -> dict:
+    """The strategy rule values a reproduction vouches for, with normalised types."""
+    return {
+        "long_short": bool(params["long_short"]),
+        "lookbacks": [int(n) for n in params["lookbacks"]],
+        "vol_target": float(params["vol_target"]),
+        "vol_window": int(params["vol_window"]),
+        "per_coin_cap_repro": float(params["per_coin_cap_repro"]),
+    }
+
+
+def strategy_sha256(params: dict) -> str:
+    """sha256 of the canonical JSON (sorted keys, no spaces) of strategy_canonical."""
+    canon = json.dumps(strategy_canonical(params), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def repro_check(target: float, ours: float) -> dict:
+    """{target, ours, rel_error, passed}: rel_error = |ours - target| / |target|,
+    passed when rel_error <= REPRO_MAX_REL_ERROR."""
+    rel = abs(ours - target) / abs(target)
+    return {"target": float(target), "ours": float(ours), "rel_error": float(rel), "passed": bool(rel <= REPRO_MAX_REL_ERROR)}
+
+
+def repro_returns(
+    close: pd.Series,
+    *,
+    long_short: bool,
+    lookbacks,
+    vol_target: float,
+    vol_window: int,
+    per_coin_cap: float,
+    cost_per_side: float,
+    rebalance_threshold: float | None,
+) -> pd.Series:
+    """Daily returns of the single-asset Combo on ``close`` (spot: no funding).
+
+    The asset is the whole universe every month and the gross cap is the
+    per-coin cap. Indicators need their history inside ``close``: until a
+    lookback's channel (or the vol window) is full it holds no position, so
+    early returns are flat. Returns run from the second day to the last.
+    """
+    frame = close.astype(float).to_frame(close.name or "ASSET")
+    col = frame.columns[0]
+    months = frame.index.to_period("M").unique()
+    universe = {(m - 1).to_timestamp(how="end").normalize().date(): [col] for m in months}
+    weights, changed = portfolio_weights(
+        frame, universe, long_short, per_coin_cap, per_coin_cap, None,
+        lookbacks=tuple(lookbacks), vol_target=vol_target, vol_window=vol_window,
+    )
+    return net_returns(weights, changed, frame, None, cost_per_side, rebalance_threshold)
+
+
+def check_repro_pass(root: Path, rd: Path, prereg: dict) -> dict:
+    """Refuse (ReproGateError) unless results/{id}-repro.json is committed and
+    unmodified, is this candidate's repro result, says passed: true, and its
+    strategy_sha256 equals the one computed from ``prereg``.
+    Returns {"path", "strategy_sha256"} for the manifest."""
+    cid = prereg["candidate_id"]
+    root = Path(root).resolve()
+    f = Path(rd).resolve() / f"{cid}-repro.json"
+    rel = f.relative_to(root).as_posix()
+    if not f.exists():
+        raise ReproGateError(
+            f"no reproduction result {rel}: run `python -m judge reproduce prereg/drafts/{cid}.json` "
+            "and commit its result before judging"
+        )
+    _committed_blob(root, f, ReproGateError)
+    try:
+        res = json.loads(f.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ReproGateError(f"{rel} is not valid JSON: {exc}") from exc
+    if not isinstance(res, dict) or res.get("kind") != "repro" or res.get("candidate_id") != cid:
+        raise ReproGateError(f"{rel} is not the repro result of {cid}")
+    if res.get("passed") is not True:
+        raise ReproGateError(f"{rel} says passed: false; {cid} did not reproduce the paper and is not judged")
+    expected = strategy_sha256(prereg)
+    if res.get("strategy_sha256") != expected:
+        raise ReproGateError(
+            f"{rel} reproduced other rules: strategy_sha256 {res.get('strategy_sha256')} vs this prereg's {expected}"
+        )
+    return {"path": rel, "strategy_sha256": expected}
+
+
+def reproduce(
+    prereg_path: Path,
+    *,
+    loader=exchange_daily,
+    cache_dir: Path | None = None,
+    results_dir: Path | None = None,
+) -> dict:
+    """Reproduce the paper's single-asset Sharpe ratios for a prereg draft and
+    write results/{candidate_id}-repro.json (pass or fail; never overwritten).
+
+    Checks (REPRO costs: 10 bps per side, 20% threshold, no funding):
+      long-only Combo, net: BTC 2015-01-01..2025-03-19 vs 1.56, ETH
+      2015-08-08..2025-03-19 vs 1.51 (Table 3). A long-short candidate adds
+      long-short BTC gross of costs vs 1.31 (Table 5 Combo).
+    Refuses before loading data when the draft's candidate_id is not its file
+    name, its paper_sample_end is not 2025-03-19, the draft is not committed
+    as is, or judge/ has uncommitted changes (the recorded judge tree hash
+    must be the code that ran).
+    """
+    path = Path(prereg_path).resolve()
+    params = load_prereg_params(path)
+    cid = params["candidate_id"]
+    if cid != path.stem:
+        raise PreregError(f"{path.name}: candidate_id {cid!r} must equal the file name {path.stem!r}")
+    if _paper_end(params, path.name) != REPRO_SAMPLE_END:
+        raise PreregError(
+            f"{path.name}: paper_sample_end {params['paper_sample_end']} is not {REPRO_SAMPLE_END}, "
+            "the sample the reproduction targets come from"
+        )
+    root = _repo_root(path.parent)
+    if root != Path(CODE_ROOT).resolve():
+        raise PreregMismatch(f"judge code runs from {Path(CODE_ROOT).resolve()} but {path.name} is in {root}")
+    results_dir = Path(results_dir) if results_dir is not None else root / "results"
+    cache_dir = Path(cache_dir) if cache_dir is not None else root / "data_cache" / "repro"
+    out = results_dir / f"{cid}-repro.json"
+    if out.exists():
+        raise ResultExists(f"{out.name} already exists; results are never overwritten")
+    blob = _committed_blob(root, path)
+    dirty = _git(root, "status", "--porcelain", "--untracked-files=all", "--", "judge")
+    if dirty:
+        raise PreregMismatch(f"uncommitted changes under judge/: {', '.join(ln[3:] for ln in dirty.splitlines())}")
+    tree_hash = _git(root, "rev-parse", "HEAD:judge")
+    git_head = _git(root, "rev-parse", "HEAD")
+    freeze = _pip_freeze()
+    run_utc = _utc_now()
+
+    with data.record_api_prices() as prices:
+        closes = {}
+        for asset in ("BTC", "ETH"):
+            s = loader(asset, REPRO_START[asset], REPRO_SAMPLE_END, cache_dir)
+            first, last = s.index[0].date(), s.index[-1].date()
+            if first != REPRO_START[asset] or last != REPRO_SAMPLE_END or s.isna().any():
+                raise data.DataIntegrityError(
+                    f"{asset}: loaded {first}..{last} (NaN: {bool(s.isna().any())}), "
+                    f"need {REPRO_START[asset]}..{REPRO_SAMPLE_END} without gaps"
+                )
+            closes[asset] = s
+
+    plan = REPRO_LONG_ONLY_CHECKS + (REPRO_LONG_SHORT_CHECKS if params["long_short"] else ())
+    strat = strategy_canonical(params)
+    per_coin_cap = strat["per_coin_cap_repro"]
+    threshold = float(REPRO["rebalance_threshold"])
+    checks = {}
+    for name, asset, ls, gross, target, table in plan:
+        cost = 0.0 if gross else float(REPRO["cost_per_side"])
+        r = repro_returns(
+            closes[asset], long_short=ls, lookbacks=strat["lookbacks"], vol_target=strat["vol_target"],
+            vol_window=strat["vol_window"], per_coin_cap=per_coin_cap, cost_per_side=cost,
+            rebalance_threshold=threshold,
+        )
+        c = repro_check(target, sharpe(r))
+        c.update({
+            "asset": asset, "long_short": ls, "gross_of_costs": gross, "cost_per_side": cost,
+            "rebalance_threshold": threshold, "paper_table": table,
+            "period": {"start": REPRO_START[asset].isoformat(), "end": REPRO_SAMPLE_END.isoformat()},
+            "scored_days": int(len(r)), "total_return": _total_return(r), "max_dd": max_drawdown(r),
+        })
+        checks[name] = c
+
+    result = {
+        "candidate_id": cid,
+        "kind": "repro",
+        "passed": bool(all(c["passed"] for c in checks.values())),
+        "checks": checks,
+        "max_rel_error": REPRO_MAX_REL_ERROR,
+        "period_notes": dict(REPRO_PERIOD_NOTES),
+        "strategy_sha256": strategy_sha256(params),
+        "strategy": strat,
+        "settings": {
+            "cost_per_side": float(REPRO["cost_per_side"]), "rebalance_threshold": threshold,
+            "gross_cap": per_coin_cap, "per_coin_cap": per_coin_cap, "funding": "none (spot)",
+            "gross_checks_cost_per_side": 0.0,
+        },
+        "sources": dict(REPRO_SOURCES),
+        "manifest": {
+            "draft_file": path.relative_to(root).as_posix(),
+            "draft_sha256": hashlib.sha256(blob).hexdigest(),
+            "judge_tree_hash": tree_hash,
+            "git_head": git_head,
+            "run_utc": run_utc,
+            "api_price_sha256": dict(sorted(prices.items())),
+            "python": sys.version,
+            "pip_freeze": freeze,
+        },
+    }
+    results_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(out, "x", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(result, indent=2) + "\n")
+    except FileExistsError as exc:
+        raise ResultExists(f"{out.name} already exists; results are never overwritten") from exc
+    return result
 
 
 # ---------------------------------------------------------------- run
@@ -983,7 +1226,8 @@ def run(
 ) -> Path:
     """Judge one candidate on one window and write results/{id}-{kind}.json.
 
-    Order: prereg integrity, kind checks, window, manifest inputs that can fail,
+    Order: prereg integrity, kind checks, window, the reproduction gate (test
+    and final_alone: check_repro_pass), manifest inputs that can fail,
     then (Final only) check_final_opened, which needs the marker written by
     ``open-final`` and committed, and only then the data load. The result file
     is written for passes and failures, and never overwritten. Costs, threshold,
@@ -1010,6 +1254,9 @@ def run(
         stamp, stamp_source, win = _final_context(path, prereg, kind, stamp_confirmed)
     else:
         stamp, stamp_source, win = None, None, window(kind, prereg, None)
+    # Test and Final-alone judge only rules that reproduced the paper (Final
+    # relies on the Test pass, which already needed this).
+    repro = check_repro_pass(root, results_dir, prereg) if kind in ("test", "final_alone") else None
     prereg_sha = committed_sha256(path)
     tree_hash = _git(root, "rev-parse", "HEAD:judge")
     git_head = _git(root, "rev-parse", "HEAD")
@@ -1088,6 +1335,7 @@ def run(
             "stamp_confirmed": stamp.isoformat() if stamp else None,
             "stamp_source": stamp_source,
             "final_marker": final_marker,
+            "repro": repro,
             "results_git_status": results_status,
             "market": MARKET,
             "data_loaded": {"start": load_start.isoformat(), "end": win[1].isoformat()},
