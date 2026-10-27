@@ -546,3 +546,42 @@ def exit_flags(close: pd.DataFrame, quote_volume: pd.DataFrame, day: date) -> li
     alive = close.loc[ts].notna()
     flagged = alive & ((median_vol < EXIT_MIN_MEDIAN_VOLUME) | (median_chg < EXIT_MIN_MEDIAN_ABS_CHANGE))
     return [s for s in close.columns if flagged[s]]
+
+
+# ---------------------------------------------------------------- moved names
+# The reproduction price loaders live in judge/prices.py (Task 8 review I2);
+# these names stay importable from judge.data.
+_MOVED_TO_PRICES = frozenset({
+    "BITSTAMP_LIMIT",
+    "BITSTAMP_OHLC",
+    "DAY_MS",
+    "DAY_S",
+    "MAX_FFILL_DAYS",
+    "POLONIEX_CANDLES",
+    "POLONIEX_CLOSE",
+    "POLONIEX_INTERVAL",
+    "POLONIEX_LIMIT",
+    "POLONIEX_START_MS",
+    "PriceRecord",
+    "_api_price_recorders",
+    "_cached_json",
+    "_covering",
+    "_parse_poloniex",
+    "_series",
+    "_utc_s",
+    "bitstamp_btcusd",
+    "exchange_daily",
+    "fill_gaps",
+    "note_api_price",
+    "poloniex_ethbtc",
+    "price_series_csv",
+    "price_series_sha256",
+    "record_api_prices",
+})
+
+
+def __getattr__(name: str):
+    if name in _MOVED_TO_PRICES:
+        from judge import prices
+        return getattr(prices, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

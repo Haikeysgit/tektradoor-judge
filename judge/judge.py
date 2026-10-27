@@ -28,6 +28,29 @@ import pandas as pd
 
 from judge import data
 from judge.costs import net_returns
+from judge.metrics import DAYS_PER_YEAR, max_drawdown, sharpe, total_return
+from judge.prices import exchange_daily  # noqa: F401  (the default reproduction loader)
+from judge.repro import (  # noqa: F401  (re-exported: the reproduction lives in judge/repro.py)
+    PRICE_DATA_DIR,
+    REPRO,
+    REPRO_LONG_ONLY_CHECKS,
+    REPRO_LONG_SHORT_CHECKS,
+    REPRO_MAX_REL_ERROR,
+    REPRO_PERIOD_NOTES,
+    REPRO_REL_ERROR_LIMIT,
+    REPRO_SAMPLE_END,
+    REPRO_SOURCES,
+    REPRO_START,
+    load_prereg_params,
+    price_data_name,
+    repro_check,
+    repro_plan,
+    repro_returns,
+    reproduce,
+    strategy_canonical,
+    strategy_sha256,
+    verify_checks,
+)
 from judge.strategies.donchian import (
     LOOKBACKS,
     PER_COIN_CAP,
@@ -41,7 +64,6 @@ from judge.strategies.donchian import (
     vol_scale,
 )
 
-DAYS_PER_YEAR = 365
 SHARPE_MIN = 1.0
 MAX_DD_LIMIT = 0.25
 KINDS = ("test", "final", "final_alone")
@@ -49,27 +71,6 @@ FINAL_KINDS = ("final", "final_alone")
 
 Kind = Literal["test", "final", "final_alone"]
 Window = tuple[date, date]
-
-
-def sharpe(daily: pd.Series) -> float:
-    x = pd.Series(daily, dtype=float).dropna().to_numpy()
-    if len(x) < 2:
-        return 0.0
-    sd = x.std(ddof=1)
-    if not np.isfinite(sd) or sd < 1e-15:  # float noise on a constant series counts as 0
-        return 0.0
-    return float(x.mean() / sd * math.sqrt(DAYS_PER_YEAR))
-
-
-def max_drawdown(daily: pd.Series) -> float:
-    """Largest peak-to-trough fall of the compounded equity curve, starting
-    from equity 1.0 before the first return. Positive fraction."""
-    x = pd.Series(daily, dtype=float).fillna(0.0).to_numpy()
-    if len(x) == 0:
-        return 0.0
-    equity = np.concatenate([[1.0], np.cumprod(1.0 + x)])
-    peak = np.maximum.accumulate(equity)
-    return float(np.max(1.0 - equity / peak))
 
 
 # ---------------------------------------------------------------- windows on series
@@ -370,12 +371,6 @@ JUDGING = {
     "n_sims": 1000,
     "universe_size": 20,
 }
-# Paper reproduction (Task 8) only: the paper's own 10 bps and 20% threshold.
-# run() never uses these; reproduction must select them explicitly.
-REPRO = {
-    "cost_per_side": 0.0010,
-    "rebalance_threshold": 0.2,
-}
 CANDIDATE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PREREG_NAME_RE = re.compile(r"^\d{2}-[A-Za-z0-9][A-Za-z0-9._-]*\.json$")
 TREE_HASH_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
@@ -421,6 +416,10 @@ class FinalGateError(JudgeRefusal):
 
 class ResultExists(JudgeRefusal):
     """A result file for this candidate and kind already exists; never overwritten."""
+
+
+class ReproGateError(JudgeRefusal):
+    """Test (or Final-alone) needs a committed, passing reproduction of the same strategy."""
 
 
 def _is_int(v) -> bool:
@@ -885,20 +884,140 @@ def _final_context(path: Path, prereg: dict, kind: Kind, stamp_flag: date | None
 def prepare_final(prereg_path: Path, *, stamp_confirmed: date | None = None, results_dir: Path | None = None) -> Path:
     """``python -m judge open-final``: every Final gate check, then write the
     marker and stop. Loads no data. The kind (final or final_alone) follows
-    from the candidate's Test window. The window's data need not exist yet."""
+    from the candidate's Test window. The window's data need not exist yet.
+    A Final-alone candidate (no Test) also needs its reproduction pass."""
     path = Path(prereg_path).resolve()
     prereg = load_prereg(path)
     check_integrity(path)
     root = _repo_root(path.parent)
     if root != Path(CODE_ROOT).resolve():
         raise PreregMismatch(f"judge code runs from {Path(CODE_ROOT).resolve()} but {path.name} is in {root}")
+    rd = Path(results_dir) if results_dir is not None else root / "results"
     kind = "final_alone" if is_final_alone(prereg) else "final"
     _, _, win = _final_context(path, prereg, kind, stamp_confirmed, latest_data_date=date.max)
+    if kind == "final_alone":
+        check_repro_pass(root, rd, prereg)
     return open_final(
         prereg["candidate_id"], prereg_sha256=committed_sha256(path), judge_tree_hash=_git(root, "rev-parse", "HEAD:judge"),
-        window=win, final_alone=kind == "final_alone",
-        results_dir=Path(results_dir) if results_dir is not None else root / "results",
+        window=win, final_alone=kind == "final_alone", results_dir=rd,
     )
+
+
+# ---------------------------------------------------------------- reproduction gate (Task 8)
+#
+# The reproduction itself is judge/repro.py. Test and Final-alone judge only
+# rules whose reproduction is committed, recomputes as a pass, and ran on the
+# same strategy, cost, metrics, repro and price code as HEAD:judge.
+
+# judge/ paths whose code decides the strategy's returns: a reproduction only
+# vouches for these exact blobs.
+REPRO_CODE_PATHS = ("strategies/", "costs.py", "metrics.py", "repro.py", "prices.py")
+
+
+def _tree_code_blobs(root: Path, tree: str) -> dict[str, str]:
+    """{path: blob sha} of REPRO_CODE_PATHS inside a judge tree (git ls-tree -r)."""
+    res = _git_run(root, "ls-tree", "-r", tree)
+    if res.returncode != 0:
+        raise ReproGateError(
+            f"judge tree {tree} (a recorded judge_tree_hash) is not in this repository: {res.stderr.decode(errors='replace').strip()}"
+        )
+    out = {}
+    for line in res.stdout.decode("utf-8").splitlines():
+        meta, _, path = line.partition("\t")
+        if any(path.startswith(c) if c.endswith("/") else path == c for c in REPRO_CODE_PATHS):
+            out[path] = meta.split()[2]
+    return out
+
+
+def check_repro_code(root: Path, repro_tree: str) -> None:
+    """Refuse unless the REPRO_CODE_PATHS files (every file under
+    strategies/) in the repro's judge tree have the same blobs as in the
+    current HEAD:judge."""
+    then = _tree_code_blobs(root, repro_tree)
+    now = _tree_code_blobs(root, _git(root, "rev-parse", "HEAD:judge"))
+    changed = sorted(p for p in set(then) | set(now) if then.get(p) != now.get(p))
+    if changed:
+        raise ReproGateError(
+            "strategy or cost code changed since reproduction; rerun reproduce "
+            f"(judge tree {repro_tree} vs HEAD:judge, differing: {', '.join('judge/' + p for p in changed)})"
+        )
+
+
+def check_repro_data(root: Path, rd: Path, res: dict, long_short: bool) -> dict[str, str]:
+    """Every price series in the repro's api_price_sha256 is committed under
+    results/repro-data/ with exactly that sha256, and the USD series of every
+    asset the checks use is among them. Returns {series name: path}."""
+    rel_name = f"{res.get('candidate_id')}-repro.json"
+    hashes = (res.get("manifest") or {}).get("api_price_sha256")
+    if not isinstance(hashes, dict):
+        raise ReproGateError(f"{rel_name} has no manifest.api_price_sha256")
+    for asset in sorted({p[1] for p in repro_plan(long_short)}):
+        key = f"usd:{asset}:{REPRO_START[asset].isoformat()}..{REPRO_SAMPLE_END.isoformat()}"
+        if key not in hashes:
+            raise ReproGateError(f"{rel_name} records no price series {key}")
+    out = {}
+    for key, sha in sorted(hashes.items()):
+        f = Path(rd).resolve() / PRICE_DATA_DIR / f"{price_data_name(key)}.csv"
+        rel = f.relative_to(Path(root).resolve()).as_posix()
+        if not f.exists():
+            raise ReproGateError(f"price data {rel} for {key} is missing: commit results/{PRICE_DATA_DIR}/ with the result")
+        blob = _committed_blob(root, f, ReproGateError)
+        actual = hashlib.sha256(blob).hexdigest()
+        if actual != sha:
+            raise ReproGateError(f"price data {rel} has sha256 {actual}, the reproduction recorded {sha} for {key}")
+        out[key] = rel
+    return out
+
+
+def check_repro_pass(root: Path, rd: Path, prereg: dict) -> dict:
+    """Refuse (ReproGateError) unless results/{id}-repro.json:
+
+    * is committed, unmodified, and touched by exactly one commit;
+    * is this candidate's repro result and says passed: true;
+    * recomputes as a pass (repro.verify_checks): the expected checks for the
+      prereg's long_short, each with the judge's target, costs, threshold and
+      period, rel_error = |ours - target| / |target| within the limit;
+    * has strategy_sha256 equal to the prereg's (rules and paper_sample_end);
+    * ran on the same REPRO_CODE_PATHS code as HEAD:judge (check_repro_code);
+    * has its price series committed under results/repro-data/ (check_repro_data).
+    The file's own ``passed`` is never trusted alone.
+    Returns {"path", "strategy_sha256", "judge_tree_hash", "price_data"} for the manifest.
+    """
+    cid = prereg["candidate_id"]
+    root = Path(root).resolve()
+    f = Path(rd).resolve() / f"{cid}-repro.json"
+    rel = f.relative_to(root).as_posix()
+    if not f.exists():
+        raise ReproGateError(
+            f"no reproduction result {rel}: run `python -m judge reproduce prereg/drafts/{cid}.json` "
+            "and commit its result before judging"
+        )
+    _committed_blob(root, f, ReproGateError)
+    _single_commit(root, f, ReproGateError, "a reproduction result is written once; a new reproduction needs a new candidate number")
+    try:
+        res = json.loads(f.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ReproGateError(f"{rel} is not valid JSON: {exc}") from exc
+    if not isinstance(res, dict) or res.get("kind") != "repro" or res.get("candidate_id") != cid:
+        raise ReproGateError(f"{rel} is not the repro result of {cid}")
+    if res.get("passed") is not True:
+        raise ReproGateError(f"{rel} says passed: false; {cid} did not reproduce the paper and is not judged")
+    problems = verify_checks(res, prereg["long_short"])
+    if problems:
+        raise ReproGateError(f"{rel} does not recompute as a passing reproduction: {'; '.join(problems)}")
+    expected = strategy_sha256(prereg)
+    if res.get("strategy_sha256") != expected:
+        raise ReproGateError(
+            f"{rel} reproduced other rules: strategy_sha256 {res.get('strategy_sha256')} vs this prereg's {expected} "
+            "(rules and paper_sample_end)"
+        )
+    manifest = res.get("manifest")
+    tree = manifest.get("judge_tree_hash") if isinstance(manifest, dict) else None
+    if not isinstance(tree, str) or not TREE_HASH_RE.match(tree):
+        raise ReproGateError(f"{rel} has no manifest.judge_tree_hash recording the code that reproduced")
+    check_repro_code(root, tree)
+    price_data = check_repro_data(root, rd, res, prereg["long_short"])
+    return {"path": rel, "strategy_sha256": expected, "judge_tree_hash": tree, "price_data": price_data}
 
 
 # ---------------------------------------------------------------- run
@@ -969,8 +1088,7 @@ def _daily_exclusions(close, qv, win: Window) -> dict[date, set[str]]:
     return out
 
 
-def _total_return(r: pd.Series) -> float:
-    return float(np.prod(1.0 + r.to_numpy(dtype=float)) - 1.0) if len(r) else 0.0
+_total_return = total_return
 
 
 def run(
@@ -983,7 +1101,8 @@ def run(
 ) -> Path:
     """Judge one candidate on one window and write results/{id}-{kind}.json.
 
-    Order: prereg integrity, kind checks, window, manifest inputs that can fail,
+    Order: prereg integrity, kind checks, window, the reproduction gate (test
+    and final_alone: check_repro_pass), manifest inputs that can fail,
     then (Final only) check_final_opened, which needs the marker written by
     ``open-final`` and committed, and only then the data load. The result file
     is written for passes and failures, and never overwritten. Costs, threshold,
@@ -1010,6 +1129,9 @@ def run(
         stamp, stamp_source, win = _final_context(path, prereg, kind, stamp_confirmed)
     else:
         stamp, stamp_source, win = None, None, window(kind, prereg, None)
+    # Test and Final-alone judge only rules that reproduced the paper (Final
+    # relies on the Test pass, which already needed this).
+    repro = check_repro_pass(root, results_dir, prereg) if kind in ("test", "final_alone") else None
     prereg_sha = committed_sha256(path)
     tree_hash = _git(root, "rev-parse", "HEAD:judge")
     git_head = _git(root, "rev-parse", "HEAD")
@@ -1088,6 +1210,7 @@ def run(
             "stamp_confirmed": stamp.isoformat() if stamp else None,
             "stamp_source": stamp_source,
             "final_marker": final_marker,
+            "repro": repro,
             "results_git_status": results_status,
             "market": MARKET,
             "data_loaded": {"start": load_start.isoformat(), "end": win[1].isoformat()},

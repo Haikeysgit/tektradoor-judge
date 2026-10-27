@@ -1,0 +1,27 @@
+{
+  "candidate_id": "02-zarattini-long-short",
+  "paper": "Zarattini, Pagani & Barbon (2025), Catching Crypto Trends, SSRN 5209907",
+  "long_short": true,
+  "lookbacks": [
+    5,
+    10,
+    20,
+    30,
+    60,
+    90,
+    150,
+    250,
+    360
+  ],
+  "vol_target": 0.25,
+  "vol_window": 90,
+  "per_coin_cap_repro": 2.0,
+  "gross_cap": 1.0,
+  "cost_per_side": 0.0011,
+  "rebalance_threshold": 0.2,
+  "universe_size": 20,
+  "paper_sample_end": "2025-03-19",
+  "seed": 20251021,
+  "n_sims": 1000,
+  "judge_tree_hash": "0000000000000000000000000000000000000000"
+}
