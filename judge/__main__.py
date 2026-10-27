@@ -79,11 +79,16 @@ def main(argv: list[str] | None = None) -> int:
         except DATA_ERRORS as exc:
             print(f"data error: {exc}", file=sys.stderr)
             return 3
-        print(f"{'PASSED' if res['passed'] else 'FAILED'} {res['candidate_id']} repro (max rel_error {res['max_rel_error']})")
+        print(
+            f"{'PASSED' if res['passed'] else 'FAILED'} {res['candidate_id']} repro "
+            f"(worst rel_error {res['worst_rel_error']:.4f}, limit {res['rel_error_limit']})"
+        )
         print(f"{'check':<22} {'target':>7} {'ours':>8} {'rel_error':>10}  passed")
         for name, c in res["checks"].items():
             print(f"{name:<22} {c['target']:>7.2f} {c['ours']:>8.4f} {c['rel_error']:>10.4f}  {c['passed']}")
         print(f"wrote {Path(J.CODE_ROOT) / 'results' / (res['candidate_id'] + '-repro.json')}")
+        print(f"price data: {', '.join(sorted(res['manifest']['price_data'].values()))}")
+        print("next: git add results/ (the repro result and results/repro-data/), commit")
         return 0 if res["passed"] else 1
 
     if args.command == "open-final":

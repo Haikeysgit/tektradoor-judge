@@ -12,5 +12,8 @@ Final is two steps: `open-final` writes results/{id}.final_opened and the operat
 ## TODO-4: Verify the OpenTimestamps proof (Task 9)
 The judge does not check `prereg/NN-name.json.ots`. Task 9: require it committed and verify it (`ots verify`), and check that the attested block time agrees with `NN-name.stamp_confirmed`. Until then the stamp date and all git dates are local claims (README "Limits").
 
-## TODO-5: repro results 01/02 Bitstamp hash range
-repro results 01/02 recorded bitstamp:btcusd hash for 2015-08-08.. only (key collision, fixed in the commit that adds this TODO: `git log -1 -- TODOS.md`); full BTC series hash is under usd:BTC.
+## TODO-5: repro results 01/02 Bitstamp hash range (first run only)
+The first reproduction run's results 01/02 recorded the bitstamp:btcusd hash for 2015-08-08.. only (key collision, fixed in the commit "fix(judge): unique api price keys, tie repro gate to strategy and cost code"; find it with the oldest commit in `git log -S"TODO-5" -- TODOS.md`). The full BTC series hash was under usd:BTC. That run's result commit was dropped from the unpushed branch before merge (review round 1), and its numbers are kept in task-8-report.md. The rerun's results use range keys, so this entry is history only.
+
+## TODO-6: Bitstamp zero-volume candles 2015-01-06..08
+Bitstamp serves flat, zero-volume candles (O=H=L=C=276.80) for 2015-01-06..08, during its January 2015 halt. They are rows, not missing days, so the 3-day forward-fill rule (`prices.fill_gaps`) does not see them. Here they fall inside the warmup (weight 0 until day 91) and change no number. The fill rule is left unchanged by ruling. A later candidate or data source should treat zero-volume rows as missing for the gap rule, or at least log them, so that a longer exchange halt cannot pass as real prices.

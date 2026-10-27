@@ -28,6 +28,29 @@ import pandas as pd
 
 from judge import data
 from judge.costs import net_returns
+from judge.metrics import DAYS_PER_YEAR, max_drawdown, sharpe, total_return
+from judge.prices import exchange_daily  # noqa: F401  (the default reproduction loader)
+from judge.repro import (  # noqa: F401  (re-exported: the reproduction lives in judge/repro.py)
+    PRICE_DATA_DIR,
+    REPRO,
+    REPRO_LONG_ONLY_CHECKS,
+    REPRO_LONG_SHORT_CHECKS,
+    REPRO_MAX_REL_ERROR,
+    REPRO_PERIOD_NOTES,
+    REPRO_REL_ERROR_LIMIT,
+    REPRO_SAMPLE_END,
+    REPRO_SOURCES,
+    REPRO_START,
+    load_prereg_params,
+    price_data_name,
+    repro_check,
+    repro_plan,
+    repro_returns,
+    reproduce,
+    strategy_canonical,
+    strategy_sha256,
+    verify_checks,
+)
 from judge.strategies.donchian import (
     LOOKBACKS,
     PER_COIN_CAP,
@@ -41,7 +64,6 @@ from judge.strategies.donchian import (
     vol_scale,
 )
 
-DAYS_PER_YEAR = 365
 SHARPE_MIN = 1.0
 MAX_DD_LIMIT = 0.25
 KINDS = ("test", "final", "final_alone")
@@ -49,27 +71,6 @@ FINAL_KINDS = ("final", "final_alone")
 
 Kind = Literal["test", "final", "final_alone"]
 Window = tuple[date, date]
-
-
-def sharpe(daily: pd.Series) -> float:
-    x = pd.Series(daily, dtype=float).dropna().to_numpy()
-    if len(x) < 2:
-        return 0.0
-    sd = x.std(ddof=1)
-    if not np.isfinite(sd) or sd < 1e-15:  # float noise on a constant series counts as 0
-        return 0.0
-    return float(x.mean() / sd * math.sqrt(DAYS_PER_YEAR))
-
-
-def max_drawdown(daily: pd.Series) -> float:
-    """Largest peak-to-trough fall of the compounded equity curve, starting
-    from equity 1.0 before the first return. Positive fraction."""
-    x = pd.Series(daily, dtype=float).fillna(0.0).to_numpy()
-    if len(x) == 0:
-        return 0.0
-    equity = np.concatenate([[1.0], np.cumprod(1.0 + x)])
-    peak = np.maximum.accumulate(equity)
-    return float(np.max(1.0 - equity / peak))
 
 
 # ---------------------------------------------------------------- windows on series
@@ -370,12 +371,6 @@ JUDGING = {
     "n_sims": 1000,
     "universe_size": 20,
 }
-# Paper reproduction (Task 8) only: the paper's own 10 bps and 20% threshold.
-# run() never uses these; reproduction must select them explicitly.
-REPRO = {
-    "cost_per_side": 0.0010,
-    "rebalance_threshold": 0.2,
-}
 CANDIDATE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PREREG_NAME_RE = re.compile(r"^\d{2}-[A-Za-z0-9][A-Za-z0-9._-]*\.json$")
 TREE_HASH_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
@@ -481,15 +476,6 @@ def load_prereg(path: Path) -> dict:
         raise PreregError(f"{path.name}: missing required key(s): {', '.join(missing)}")
     _validate(raw, path.name)
     return raw
-
-
-def load_prereg_params(path: Path) -> dict:
-    """Read a prereg draft (prereg/drafts/NN-name.json) for reproduction.
-
-    The same key and type validation as load_prereg, and NO integrity check:
-    a draft is not registered yet and cannot carry the final judge_tree_hash.
-    """
-    return load_prereg(path)
 
 
 def _paper_end(prereg: dict, name: str = "prereg") -> date:
@@ -917,91 +903,15 @@ def prepare_final(prereg_path: Path, *, stamp_confirmed: date | None = None, res
     )
 
 
-# ---------------------------------------------------------------- reproduction (Task 8)
+# ---------------------------------------------------------------- reproduction gate (Task 8)
 #
-# Before a candidate is judged, the judge must reproduce the paper's own
-# single-asset Sharpe ratios with the paper's own costs (REPRO). A miss of more
-# than REPRO_MAX_REL_ERROR on any check fails the reproduction; nobody tunes.
-
-exchange_daily = data.exchange_daily  # the default reproduction price loader
-
-REPRO_MAX_REL_ERROR = 0.20
-REPRO_SAMPLE_END = date(2025, 3, 19)  # SSRN 5209907 sample end
-REPRO_START = {"BTC": date(2015, 1, 1), "ETH": date(2015, 8, 8)}
-REPRO_PERIOD_NOTES = {
-    "BTC": "2015-01-01..2025-03-19, as the paper",
-    "ETH": "starts 2015-08-08 (Poloniex listing), paper 2015-08-01",
-}
-REPRO_SOURCES = {
-    "BTC": f"Bitstamp btcusd daily close, candle opening 00:00 UTC ({data.BITSTAMP_OHLC})",
-    "ETH": f"Poloniex ETH_BTC DAY_1 close ({data.POLONIEX_CANDLES}) x Bitstamp btcusd close, same UTC day",
-}
-# (name, asset, long_short, gross of costs, paper Sharpe, paper table)
-REPRO_LONG_ONLY_CHECKS = (
-    ("btc_long_only_net", "BTC", False, False, 1.56, "Table 3"),
-    ("eth_long_only_net", "ETH", False, False, 1.51, "Table 3"),
-)
-REPRO_LONG_SHORT_CHECKS = (
-    ("btc_long_short_gross", "BTC", True, True, 1.31, "Table 5 Combo"),
-)
-
-
-def strategy_canonical(params: dict) -> dict:
-    """The strategy rule values a reproduction vouches for, with normalised types."""
-    return {
-        "long_short": bool(params["long_short"]),
-        "lookbacks": [int(n) for n in params["lookbacks"]],
-        "vol_target": float(params["vol_target"]),
-        "vol_window": int(params["vol_window"]),
-        "per_coin_cap_repro": float(params["per_coin_cap_repro"]),
-    }
-
-
-def strategy_sha256(params: dict) -> str:
-    """sha256 of the canonical JSON (sorted keys, no spaces) of strategy_canonical."""
-    canon = json.dumps(strategy_canonical(params), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
-
-
-def repro_check(target: float, ours: float) -> dict:
-    """{target, ours, rel_error, passed}: rel_error = |ours - target| / |target|,
-    passed when rel_error <= REPRO_MAX_REL_ERROR."""
-    rel = abs(ours - target) / abs(target)
-    return {"target": float(target), "ours": float(ours), "rel_error": float(rel), "passed": bool(rel <= REPRO_MAX_REL_ERROR)}
-
-
-def repro_returns(
-    close: pd.Series,
-    *,
-    long_short: bool,
-    lookbacks,
-    vol_target: float,
-    vol_window: int,
-    per_coin_cap: float,
-    cost_per_side: float,
-    rebalance_threshold: float | None,
-) -> pd.Series:
-    """Daily returns of the single-asset Combo on ``close`` (spot: no funding).
-
-    The asset is the whole universe every month and the gross cap is the
-    per-coin cap. Indicators need their history inside ``close``: until a
-    lookback's channel (or the vol window) is full it holds no position, so
-    early returns are flat. Returns run from the second day to the last.
-    """
-    frame = close.astype(float).to_frame(close.name or "ASSET")
-    col = frame.columns[0]
-    months = frame.index.to_period("M").unique()
-    universe = {(m - 1).to_timestamp(how="end").normalize().date(): [col] for m in months}
-    weights, changed = portfolio_weights(
-        frame, universe, long_short, per_coin_cap, per_coin_cap, None,
-        lookbacks=tuple(lookbacks), vol_target=vol_target, vol_window=vol_window,
-    )
-    return net_returns(weights, changed, frame, None, cost_per_side, rebalance_threshold)
-
+# The reproduction itself is judge/repro.py. Test and Final-alone judge only
+# rules whose reproduction is committed, recomputes as a pass, and ran on the
+# same strategy, cost, metrics, repro and price code as HEAD:judge.
 
 # judge/ paths whose code decides the strategy's returns: a reproduction only
 # vouches for these exact blobs.
-REPRO_CODE_PATHS = ("strategies/", "costs.py")
+REPRO_CODE_PATHS = ("strategies/", "costs.py", "metrics.py", "repro.py", "prices.py")
 
 
 def _tree_code_blobs(root: Path, tree: str) -> dict[str, str]:
@@ -1014,14 +924,15 @@ def _tree_code_blobs(root: Path, tree: str) -> dict[str, str]:
     out = {}
     for line in res.stdout.decode("utf-8").splitlines():
         meta, _, path = line.partition("\t")
-        if path == "costs.py" or path.startswith("strategies/"):
+        if any(path.startswith(c) if c.endswith("/") else path == c for c in REPRO_CODE_PATHS):
             out[path] = meta.split()[2]
     return out
 
 
 def check_repro_code(root: Path, repro_tree: str) -> None:
-    """Refuse unless strategies/ (every file) and costs.py in the repro's
-    judge tree have the same blobs as in the current HEAD:judge."""
+    """Refuse unless the REPRO_CODE_PATHS files (every file under
+    strategies/) in the repro's judge tree have the same blobs as in the
+    current HEAD:judge."""
     then = _tree_code_blobs(root, repro_tree)
     now = _tree_code_blobs(root, _git(root, "rev-parse", "HEAD:judge"))
     changed = sorted(p for p in set(then) | set(now) if then.get(p) != now.get(p))
@@ -1032,13 +943,46 @@ def check_repro_code(root: Path, repro_tree: str) -> None:
         )
 
 
+def check_repro_data(root: Path, rd: Path, res: dict, long_short: bool) -> dict[str, str]:
+    """Every price series in the repro's api_price_sha256 is committed under
+    results/repro-data/ with exactly that sha256, and the USD series of every
+    asset the checks use is among them. Returns {series name: path}."""
+    rel_name = f"{res.get('candidate_id')}-repro.json"
+    hashes = (res.get("manifest") or {}).get("api_price_sha256")
+    if not isinstance(hashes, dict):
+        raise ReproGateError(f"{rel_name} has no manifest.api_price_sha256")
+    for asset in sorted({p[1] for p in repro_plan(long_short)}):
+        key = f"usd:{asset}:{REPRO_START[asset].isoformat()}..{REPRO_SAMPLE_END.isoformat()}"
+        if key not in hashes:
+            raise ReproGateError(f"{rel_name} records no price series {key}")
+    out = {}
+    for key, sha in sorted(hashes.items()):
+        f = Path(rd).resolve() / PRICE_DATA_DIR / f"{price_data_name(key)}.csv"
+        rel = f.relative_to(Path(root).resolve()).as_posix()
+        if not f.exists():
+            raise ReproGateError(f"price data {rel} for {key} is missing: commit results/{PRICE_DATA_DIR}/ with the result")
+        blob = _committed_blob(root, f, ReproGateError)
+        actual = hashlib.sha256(blob).hexdigest()
+        if actual != sha:
+            raise ReproGateError(f"price data {rel} has sha256 {actual}, the reproduction recorded {sha} for {key}")
+        out[key] = rel
+    return out
+
+
 def check_repro_pass(root: Path, rd: Path, prereg: dict) -> dict:
-    """Refuse (ReproGateError) unless results/{id}-repro.json is committed and
-    unmodified, is this candidate's repro result, says passed: true, its
-    strategy_sha256 equals the one computed from ``prereg``, and the strategy
-    and cost code (REPRO_CODE_PATHS) in its recorded judge_tree_hash equals
-    the code in HEAD:judge (check_repro_code).
-    Returns {"path", "strategy_sha256", "judge_tree_hash"} for the manifest."""
+    """Refuse (ReproGateError) unless results/{id}-repro.json:
+
+    * is committed, unmodified, and touched by exactly one commit;
+    * is this candidate's repro result and says passed: true;
+    * recomputes as a pass (repro.verify_checks): the expected checks for the
+      prereg's long_short, each with the judge's target, costs, threshold and
+      period, rel_error = |ours - target| / |target| within the limit;
+    * has strategy_sha256 equal to the prereg's (rules and paper_sample_end);
+    * ran on the same REPRO_CODE_PATHS code as HEAD:judge (check_repro_code);
+    * has its price series committed under results/repro-data/ (check_repro_data).
+    The file's own ``passed`` is never trusted alone.
+    Returns {"path", "strategy_sha256", "judge_tree_hash", "price_data"} for the manifest.
+    """
     cid = prereg["candidate_id"]
     root = Path(root).resolve()
     f = Path(rd).resolve() / f"{cid}-repro.json"
@@ -1049,6 +993,7 @@ def check_repro_pass(root: Path, rd: Path, prereg: dict) -> dict:
             "and commit its result before judging"
         )
     _committed_blob(root, f, ReproGateError)
+    _single_commit(root, f, ReproGateError, "a reproduction result is written once; a new reproduction needs a new candidate number")
     try:
         res = json.loads(f.read_text(encoding="utf-8"))
     except ValueError as exc:
@@ -1057,131 +1002,22 @@ def check_repro_pass(root: Path, rd: Path, prereg: dict) -> dict:
         raise ReproGateError(f"{rel} is not the repro result of {cid}")
     if res.get("passed") is not True:
         raise ReproGateError(f"{rel} says passed: false; {cid} did not reproduce the paper and is not judged")
+    problems = verify_checks(res, prereg["long_short"])
+    if problems:
+        raise ReproGateError(f"{rel} does not recompute as a passing reproduction: {'; '.join(problems)}")
     expected = strategy_sha256(prereg)
     if res.get("strategy_sha256") != expected:
         raise ReproGateError(
-            f"{rel} reproduced other rules: strategy_sha256 {res.get('strategy_sha256')} vs this prereg's {expected}"
+            f"{rel} reproduced other rules: strategy_sha256 {res.get('strategy_sha256')} vs this prereg's {expected} "
+            "(rules and paper_sample_end)"
         )
     manifest = res.get("manifest")
     tree = manifest.get("judge_tree_hash") if isinstance(manifest, dict) else None
     if not isinstance(tree, str) or not TREE_HASH_RE.match(tree):
         raise ReproGateError(f"{rel} has no manifest.judge_tree_hash recording the code that reproduced")
     check_repro_code(root, tree)
-    return {"path": rel, "strategy_sha256": expected, "judge_tree_hash": tree}
-
-
-def reproduce(
-    prereg_path: Path,
-    *,
-    loader=exchange_daily,
-    cache_dir: Path | None = None,
-    results_dir: Path | None = None,
-) -> dict:
-    """Reproduce the paper's single-asset Sharpe ratios for a prereg draft and
-    write results/{candidate_id}-repro.json (pass or fail; never overwritten).
-
-    Checks (REPRO costs: 10 bps per side, 20% threshold, no funding):
-      long-only Combo, net: BTC 2015-01-01..2025-03-19 vs 1.56, ETH
-      2015-08-08..2025-03-19 vs 1.51 (Table 3). A long-short candidate adds
-      long-short BTC gross of costs vs 1.31 (Table 5 Combo).
-    Refuses before loading data when the draft's candidate_id is not its file
-    name, its paper_sample_end is not 2025-03-19, the draft is not committed
-    as is, or judge/ has uncommitted changes (the recorded judge tree hash
-    must be the code that ran).
-    """
-    path = Path(prereg_path).resolve()
-    params = load_prereg_params(path)
-    cid = params["candidate_id"]
-    if cid != path.stem:
-        raise PreregError(f"{path.name}: candidate_id {cid!r} must equal the file name {path.stem!r}")
-    if _paper_end(params, path.name) != REPRO_SAMPLE_END:
-        raise PreregError(
-            f"{path.name}: paper_sample_end {params['paper_sample_end']} is not {REPRO_SAMPLE_END}, "
-            "the sample the reproduction targets come from"
-        )
-    root = _repo_root(path.parent)
-    if root != Path(CODE_ROOT).resolve():
-        raise PreregMismatch(f"judge code runs from {Path(CODE_ROOT).resolve()} but {path.name} is in {root}")
-    results_dir = Path(results_dir) if results_dir is not None else root / "results"
-    cache_dir = Path(cache_dir) if cache_dir is not None else root / "data_cache" / "repro"
-    out = results_dir / f"{cid}-repro.json"
-    if out.exists():
-        raise ResultExists(f"{out.name} already exists; results are never overwritten")
-    blob = _committed_blob(root, path)
-    dirty = _git(root, "status", "--porcelain", "--untracked-files=all", "--", "judge")
-    if dirty:
-        raise PreregMismatch(f"uncommitted changes under judge/: {', '.join(ln[3:] for ln in dirty.splitlines())}")
-    tree_hash = _git(root, "rev-parse", "HEAD:judge")
-    git_head = _git(root, "rev-parse", "HEAD")
-    freeze = _pip_freeze()
-    run_utc = _utc_now()
-
-    with data.record_api_prices() as prices:
-        closes = {}
-        for asset in ("BTC", "ETH"):
-            s = loader(asset, REPRO_START[asset], REPRO_SAMPLE_END, cache_dir)
-            first, last = s.index[0].date(), s.index[-1].date()
-            if first != REPRO_START[asset] or last != REPRO_SAMPLE_END or s.isna().any():
-                raise data.DataIntegrityError(
-                    f"{asset}: loaded {first}..{last} (NaN: {bool(s.isna().any())}), "
-                    f"need {REPRO_START[asset]}..{REPRO_SAMPLE_END} without gaps"
-                )
-            closes[asset] = s
-
-    plan = REPRO_LONG_ONLY_CHECKS + (REPRO_LONG_SHORT_CHECKS if params["long_short"] else ())
-    strat = strategy_canonical(params)
-    per_coin_cap = strat["per_coin_cap_repro"]
-    threshold = float(REPRO["rebalance_threshold"])
-    checks = {}
-    for name, asset, ls, gross, target, table in plan:
-        cost = 0.0 if gross else float(REPRO["cost_per_side"])
-        r = repro_returns(
-            closes[asset], long_short=ls, lookbacks=strat["lookbacks"], vol_target=strat["vol_target"],
-            vol_window=strat["vol_window"], per_coin_cap=per_coin_cap, cost_per_side=cost,
-            rebalance_threshold=threshold,
-        )
-        c = repro_check(target, sharpe(r))
-        c.update({
-            "asset": asset, "long_short": ls, "gross_of_costs": gross, "cost_per_side": cost,
-            "rebalance_threshold": threshold, "paper_table": table,
-            "period": {"start": REPRO_START[asset].isoformat(), "end": REPRO_SAMPLE_END.isoformat()},
-            "scored_days": int(len(r)), "total_return": _total_return(r), "max_dd": max_drawdown(r),
-        })
-        checks[name] = c
-
-    result = {
-        "candidate_id": cid,
-        "kind": "repro",
-        "passed": bool(all(c["passed"] for c in checks.values())),
-        "checks": checks,
-        "max_rel_error": REPRO_MAX_REL_ERROR,
-        "period_notes": dict(REPRO_PERIOD_NOTES),
-        "strategy_sha256": strategy_sha256(params),
-        "strategy": strat,
-        "settings": {
-            "cost_per_side": float(REPRO["cost_per_side"]), "rebalance_threshold": threshold,
-            "gross_cap": per_coin_cap, "per_coin_cap": per_coin_cap, "funding": "none (spot)",
-            "gross_checks_cost_per_side": 0.0,
-        },
-        "sources": dict(REPRO_SOURCES),
-        "manifest": {
-            "draft_file": path.relative_to(root).as_posix(),
-            "draft_sha256": hashlib.sha256(blob).hexdigest(),
-            "judge_tree_hash": tree_hash,
-            "git_head": git_head,
-            "run_utc": run_utc,
-            "api_price_sha256": dict(sorted(prices.items())),
-            "python": sys.version,
-            "pip_freeze": freeze,
-        },
-    }
-    results_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(out, "x", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(result, indent=2) + "\n")
-    except FileExistsError as exc:
-        raise ResultExists(f"{out.name} already exists; results are never overwritten") from exc
-    return result
+    price_data = check_repro_data(root, rd, res, prereg["long_short"])
+    return {"path": rel, "strategy_sha256": expected, "judge_tree_hash": tree, "price_data": price_data}
 
 
 # ---------------------------------------------------------------- run
@@ -1252,8 +1088,7 @@ def _daily_exclusions(close, qv, win: Window) -> dict[date, set[str]]:
     return out
 
 
-def _total_return(r: pd.Series) -> float:
-    return float(np.prod(1.0 + r.to_numpy(dtype=float)) - 1.0) if len(r) else 0.0
+_total_return = total_return
 
 
 def run(

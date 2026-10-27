@@ -104,15 +104,47 @@ def _commit_test_result(repo: Path, p: Path, passed=True, **manifest_over) -> Pa
     return out
 
 
-def _commit_repro_pass(repo: Path, p: Path) -> Path:
-    """A committed, passing reproduction of p's rules (Task 8 gate for Test runs)."""
+def _repro_record(repo: Path, params: dict, tree=None, ours=None) -> dict:
+    """A repro result in reproduce()'s format that recomputes as a pass (each
+    ``ours`` defaults to its target), with its price CSVs written under
+    results/repro-data/ (not committed)."""
+    checks = {}
+    for name, asset, ls, gross, target, table in J.repro_plan(params["long_short"]):
+        o = (ours or {}).get(name, target)
+        rel = abs(o - target) / abs(target)
+        checks[name] = {
+            "target": target, "ours": o, "rel_error": rel, "passed": rel <= J.REPRO_REL_ERROR_LIMIT,
+            "asset": asset, "long_short": ls, "gross_of_costs": gross,
+            "cost_per_side": 0.0 if gross else J.REPRO["cost_per_side"],
+            "rebalance_threshold": J.REPRO["rebalance_threshold"], "paper_table": table,
+            "period": {"start": J.REPRO_START[asset].isoformat(), "end": J.REPRO_SAMPLE_END.isoformat()},
+        }
+    hashes = {}
+    for asset in sorted({c["asset"] for c in checks.values()}):
+        key = f"usd:{asset}:{J.REPRO_START[asset].isoformat()}..{J.REPRO_SAMPLE_END.isoformat()}"
+        csv = f"date,close\n{J.REPRO_START[asset].isoformat()},100.0\n"
+        _write_bytes(repo / "results" / J.PRICE_DATA_DIR / f"{J.price_data_name(key)}.csv", csv)
+        hashes[key] = hashlib.sha256(csv.encode()).hexdigest()
+    return {
+        "candidate_id": params["candidate_id"], "kind": "repro",
+        "passed": all(c["passed"] for c in checks.values()), "checks": checks,
+        "rel_error_limit": J.REPRO_REL_ERROR_LIMIT, "worst_rel_error": max(c["rel_error"] for c in checks.values()),
+        "strategy_sha256": J.strategy_sha256(params),
+        "manifest": {"judge_tree_hash": tree or _git(repo, "rev-parse", "HEAD:judge"), "api_price_sha256": hashes},
+    }
+
+
+def _commit_repro_pass(repo: Path, p: Path, tree=None, ours=None, mutate=None, commit=True) -> Path:
+    """Write (and commit) results/{id}-repro.json for p's rules: a pass unless
+    ``ours`` or ``mutate(record)`` says otherwise (Task 8 gate for Test runs)."""
     params = load_prereg(p)
+    rec = _repro_record(repo, params, tree=tree, ours=ours)
+    if mutate is not None:
+        mutate(rec)
     out = repo / "results" / f"{params['candidate_id']}-repro.json"
-    rec = {"candidate_id": params["candidate_id"], "kind": "repro", "passed": True,
-           "strategy_sha256": J.strategy_sha256(params),
-           "manifest": {"judge_tree_hash": _git(repo, "rev-parse", "HEAD:judge")}}
     _write_bytes(out, json.dumps(rec) + "\n")
-    _commit(repo, "repro result")
+    if commit:
+        _commit(repo, "repro result")
     return out
 
 
