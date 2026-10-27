@@ -25,6 +25,9 @@ from judge.judge import (
 )
 
 NAME = "01-demo-long"
+STAMP = date(2026, 6, 1)
+FINAL_WIN = (date(2026, 6, 2), date(2026, 8, 30))
+TEST_RUN_UTC = "2026-05-20T10:00:00Z"
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -35,7 +38,7 @@ def _git(repo: Path, *args: str) -> str:
     return res.stdout.strip()
 
 
-def _prereg_dict(tree_hash: str, **over) -> dict:
+def _prereg_dict(tree_hash: str = "0" * 40, **over) -> dict:
     d = {
         "candidate_id": NAME,
         "paper": "SSRN 5209907",
@@ -50,28 +53,62 @@ def _prereg_dict(tree_hash: str, **over) -> dict:
         "universe_size": 20,
         "paper_sample_end": "2025-03-19",
         "seed": 7,
-        "n_sims": 8,
+        "n_sims": J.JUDGING["n_sims"],
         "judge_tree_hash": tree_hash,
     }
     d.update(over)
     return d
 
 
-def _write_bytes(path: Path, text: str) -> None:
+def _write_bytes(path: Path, text) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(text.encode())
+    path.write_bytes(text if isinstance(text, bytes) else text.encode())
 
 
-def _register(repo: Path, **over) -> Path:
+def _commit(repo: Path, msg: str) -> None:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", msg)
+
+
+def _register(repo: Path, name: str = NAME, **over) -> Path:
     """Write prereg/NN-name.json (+ .sha256) for the committed judge tree; commit."""
     tree = _git(repo, "rev-parse", "HEAD:judge")
-    p = repo / "prereg" / f"{NAME}.json"
+    p = repo / "prereg" / f"{name}.json"
     _write_bytes(p, json.dumps(_prereg_dict(tree, **over), indent=2) + "\n")
     sha = hashlib.sha256(p.read_bytes()).hexdigest()
     _write_bytes(p.with_suffix(".sha256"), f"{sha}  {p.name}\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "register")
+    _commit(repo, "register")
     return p
+
+
+def _stamp(repo: Path, p: Path, day: date = STAMP) -> None:
+    _write_bytes(p.with_suffix(".stamp_confirmed"), f"{day.isoformat()}\n")
+    _commit(repo, "stamp confirmed")
+
+
+def _commit_test_result(repo: Path, p: Path, passed=True, **manifest_over) -> Path:
+    m = {
+        "prereg_sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+        "judge_tree_hash": _git(repo, "rev-parse", "HEAD:judge"),
+        "run_utc": TEST_RUN_UTC,
+    }
+    m.update(manifest_over)
+    out = repo / "results" / f"{NAME}-test.json"
+    _write_bytes(out, json.dumps({"candidate_id": NAME, "kind": "test", "passed": passed, "manifest": m}) + "\n")
+    _commit(repo, "test result")
+    return out
+
+
+def _gate_kw(repo: Path, p: Path, **over) -> dict:
+    kw = dict(
+        prereg_sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
+        judge_tree_hash=_git(repo, "rev-parse", "HEAD:judge"),
+        window=FINAL_WIN,
+        stamp_confirmed=STAMP,
+        results_dir=repo / "results",
+    )
+    kw.update(over)
+    return kw
 
 
 @pytest.fixture
@@ -80,35 +117,69 @@ def repo(tmp_path, monkeypatch):
     root.mkdir()
     _git(root, "init", "-q")
     _write_bytes(root / ".gitattributes", "* text=auto eol=lf\n")
-    _write_bytes(root / ".gitignore", "results/\ndata_cache/\n")
+    _write_bytes(root / ".gitignore", "data_cache/\n")  # results/ is committed, as in the real repo
     _write_bytes(root / "judge" / "__init__.py", "# judge\n")
-    _git(root, "add", "-A")
-    _git(root, "commit", "-q", "-m", "judge")
+    _commit(root, "judge")
     monkeypatch.setattr(J, "CODE_ROOT", root)
     monkeypatch.setattr(J, "_pip_freeze", lambda: ["numpy==0.0-test"])
+    monkeypatch.setitem(J.JUDGING, "n_sims", 8)  # keep run() tests fast
     return root
 
 
-# ---------------------------------------------------------------- load / integrity
+# ---------------------------------------------------------------- load / validation
 
 def test_missing_key_raises_prereg_error(tmp_path):
-    d = _prereg_dict("abc")
+    d = _prereg_dict()
     del d["seed"]
     p = tmp_path / "01-x.json"
     p.write_text(json.dumps(d))
     with pytest.raises(PreregError, match="seed"):
         load_prereg(p)
-    d = _prereg_dict("abc")
-    p.write_text(json.dumps(d))
+    p.write_text(json.dumps(_prereg_dict()))
     assert load_prereg(p)["candidate_id"] == NAME
 
 
 def test_bad_candidate_id_refused(tmp_path):
     p = tmp_path / "01-x.json"
-    p.write_text(json.dumps(_prereg_dict("abc", candidate_id="../evil")))
+    p.write_text(json.dumps(_prereg_dict(candidate_id="../evil")))
     with pytest.raises(PreregError, match="candidate_id"):
         load_prereg(p)
 
+
+@pytest.mark.parametrize("key,value", [
+    ("cost_per_side", 0.0),
+    ("cost_per_side", 0.001),  # the paper's 10 bps is repro only
+    ("rebalance_threshold", None),
+    ("rebalance_threshold", 0.1),
+    ("gross_cap", None),
+    ("gross_cap", 3.0),
+    ("n_sims", 8),
+    ("universe_size", 10),
+    ("universe_size", 20.0),  # strict: must be a JSON integer
+    ("long_short", "false"),  # strict: bool("false") is True
+    ("long_short", 0),
+    ("lookbacks", []),
+    ("lookbacks", [5, 0]),
+    ("lookbacks", [5, True]),
+    ("vol_window", 30.5),
+    ("vol_target", "0.25"),
+    ("seed", True),
+    ("judge_tree_hash", 123),
+])
+def test_judging_constants_and_types_enforced(tmp_path, key, value):
+    p = tmp_path / "01-x.json"
+    p.write_text(json.dumps(_prereg_dict(**{key: value})))
+    with pytest.raises(PreregError, match=key):
+        load_prereg(p)
+
+
+def test_repro_cost_is_separate_from_judging():
+    assert J.JUDGING["cost_per_side"] == 0.0011
+    assert J.REPRO["cost_per_side"] == 0.0010
+    assert "repro" not in J.KINDS  # run() can only judge with JUDGING
+
+
+# ---------------------------------------------------------------- integrity
 
 def test_edited_prereg_refused(repo):
     # Review Focus 5: an edit after stamping, even one that is committed.
@@ -116,7 +187,7 @@ def test_edited_prereg_refused(repo):
     check_integrity(p)  # as registered: fine
     registered = p.with_suffix(".sha256").read_text().split()[0]
     p.write_bytes(p.read_bytes().replace(b'"seed": 7', b'"seed": 8'))
-    _git(repo, "commit", "-q", "-am", "tweak seed")
+    _commit(repo, "tweak seed")
     edited = hashlib.sha256(p.read_bytes()).hexdigest()
     with pytest.raises(PreregMismatch) as ei:
         check_integrity(p)
@@ -139,7 +210,7 @@ def test_judge_tree_hash_mismatch_refused(repo):
     p = _register(repo)
     recorded = load_prereg(p)["judge_tree_hash"]
     _write_bytes(repo / "judge" / "__init__.py", "# judge v2\n")
-    _git(repo, "commit", "-q", "-am", "change judge")
+    _commit(repo, "change judge")
     head = _git(repo, "rev-parse", "HEAD:judge")
     with pytest.raises(PreregMismatch) as ei:
         check_integrity(p)
@@ -150,63 +221,177 @@ def test_judge_tree_hash_mismatch_refused(repo):
 def test_missing_sha256_companion_refused(repo):
     p = _register(repo)
     p.with_suffix(".sha256").unlink()
-    _git(repo, "commit", "-q", "-am", "drop sha")
+    _commit(repo, "drop sha")
     with pytest.raises(PreregMismatch, match="sha256"):
+        check_integrity(p)
+
+
+def test_prereg_outside_prereg_dir_refused(repo):
+    # Review C1: an untracked copy with tweaked rules and a self-made .sha256.
+    p = _register(repo)
+    fake = repo / "scratch" / p.name
+    _write_bytes(fake, p.read_bytes())
+    _write_bytes(fake.with_suffix(".sha256"), p.with_suffix(".sha256").read_bytes())
+    with pytest.raises(PreregMismatch, match="prereg/NN-name.json"):
+        check_integrity(fake)
+
+
+def test_prereg_must_be_nn_name_and_match_candidate_id(repo):
+    p = _register(repo)
+    with pytest.raises(PreregMismatch, match="candidate_id"):
+        check_integrity(_register(repo, name="02-other"))  # candidate_id is still NAME
+    with pytest.raises(PreregMismatch, match="NN-name"):
+        check_integrity(_register(repo, name="demo", candidate_id="demo"))
+    check_integrity(p)
+
+
+def test_untracked_prereg_refused_even_if_tree_clean_elsewhere(repo):
+    # A prereg/ file that was never committed (even with prereg/ otherwise clean).
+    p = _register(repo)
+    _git(repo, "rm", "-q", "--cached", str(p.relative_to(repo)))
+    _git(repo, "commit", "-q", "-m", "untrack")
+    with pytest.raises(PreregMismatch, match="not committed"):
+        check_integrity(p)
+
+
+def test_crlf_working_copy_differs_from_committed_blob_refused(repo):
+    # Review I7: with eol=lf, a CRLF working file commits as LF and git status
+    # stays clean, but the bytes hashed and the bytes in git differ.
+    tree = _git(repo, "rev-parse", "HEAD:judge")
+    p = repo / "prereg" / f"{NAME}.json"
+    _write_bytes(p, (json.dumps(_prereg_dict(tree), indent=2) + "\n").replace("\n", "\r\n"))
+    _write_bytes(p.with_suffix(".sha256"), f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n")
+    _commit(repo, "register crlf")
+    assert _git(repo, "status", "--porcelain") == ""
+    with pytest.raises(PreregMismatch, match="committed blob"):
         check_integrity(p)
 
 
 # ---------------------------------------------------------------- windows
 
 def test_test_window_starts_after_paper_sample():
-    pre = _prereg_dict("x", paper_sample_end="2025-03-19")
+    pre = _prereg_dict(paper_sample_end="2025-03-19")
     assert window("test", pre, None) == (date(2025, 3, 20), date(2026, 10, 19))
-    early = _prereg_dict("x", paper_sample_end="2021-06-30")
+    early = _prereg_dict(paper_sample_end="2021-06-30")
     assert window("test", early, None) == (date(2023, 1, 1), date(2026, 10, 19))
 
 
 def test_final_needs_stamp_and_full_data():
-    pre = _prereg_dict("x")
+    pre = _prereg_dict()
     with pytest.raises(FinalNotReady, match="stamp_confirmed"):
         window("final", pre, None, latest_data_date=date(2026, 10, 20))
     # 90 days starting the day after the stamp date.
-    assert window("final", pre, date(2026, 6, 1), latest_data_date=date(2026, 10, 20)) == (
-        date(2026, 6, 2), date(2026, 8, 30))
-    assert window("final_alone", pre, date(2026, 6, 1), latest_data_date=date(2026, 8, 30))[1] == date(2026, 8, 30)
+    assert window("final", pre, STAMP, latest_data_date=date(2026, 10, 20)) == FINAL_WIN
+    assert window("final_alone", pre, STAMP, latest_data_date=date(2026, 8, 30))[1] == date(2026, 8, 30)
     with pytest.raises(FinalNotReady, match="2026-08-29"):
-        window("final", pre, date(2026, 6, 1), latest_data_date=date(2026, 8, 29))
+        window("final", pre, STAMP, latest_data_date=date(2026, 8, 29))
+
+
+# ---------------------------------------------------------------- stamp_confirmed
+
+def test_final_needs_committed_stamp_file_flag_only_confirms(repo):
+    p = _register(repo)
+    with pytest.raises(FinalNotReady, match="only confirm"):
+        J.resolve_stamp_confirmed(p, STAMP)  # flag without the file
+    assert J.resolve_stamp_confirmed(p, None) == (None, None)
+    _stamp(repo, p)
+    assert J.resolve_stamp_confirmed(p, None) == (STAMP, "file")
+    assert J.resolve_stamp_confirmed(p, STAMP) == (STAMP, "file+flag")
+    with pytest.raises(PreregError, match="conflict"):
+        J.resolve_stamp_confirmed(p, STAMP + timedelta(days=1))
+    _write_bytes(p.with_suffix(".stamp_confirmed"), "2026-06-01\n2026-06-02\n")
+    with pytest.raises(PreregError, match="single"):
+        J.resolve_stamp_confirmed(p, None)
+
+
+def test_uncommitted_stamp_file_refused(repo):
+    p = _register(repo)
+    _write_bytes(p.with_suffix(".stamp_confirmed"), "2026-06-01\n")
+    with pytest.raises(PreregMismatch):
+        check_integrity(p)
 
 
 # ---------------------------------------------------------------- final gate
 
-def _write_test_result(results: Path, passed: bool) -> None:
-    results.mkdir(parents=True, exist_ok=True)
-    (results / f"{NAME}-test.json").write_text(json.dumps({"passed": passed}))
+def test_second_final_open_refused(repo):
+    p = _register(repo)
+    _stamp(repo, p)
+    _commit_test_result(repo, p)
+    assert open_final(NAME, **_gate_kw(repo, p)) == "opened"
+    marker = repo / "results" / f"{NAME}.final_opened"
+    rec = json.loads(marker.read_text())
+    assert rec["window"] == {"start": "2026-06-02", "end": "2026-08-30"}
+    assert rec["prereg_sha256"] == hashlib.sha256(p.read_bytes()).hexdigest()
+    # A different window (or prereg or judge) is a second opening: refused.
+    with pytest.raises(FinalGateError, match="does not match"):
+        open_final(NAME, **_gate_kw(repo, p, window=(date(2026, 7, 2), date(2026, 9, 29))))
+    # Same marker, no result: resume.
+    assert open_final(NAME, **_gate_kw(repo, p)) == "resumed"
 
 
-def test_second_final_open_refused(tmp_path):
-    res = tmp_path / "results"
-    _write_test_result(res, True)
-    open_final(NAME, results_dir=res)
-    assert (res / f"{NAME}.final_opened").exists()
-    with pytest.raises(FinalGateError, match="already"):
-        open_final(NAME, results_dir=res)
+def test_final_marker_or_result_ever_committed_refused(repo):
+    # Review I3: deleting a committed marker/result does not reopen Final.
+    p = _register(repo)
+    _stamp(repo, p)
+    _commit_test_result(repo, p)
+    open_final(NAME, **_gate_kw(repo, p))
+    _commit(repo, "marker")
+    (repo / "results" / f"{NAME}.final_opened").unlink()
+    _commit(repo, "delete marker")
+    with pytest.raises(FinalGateError, match="history"):
+        open_final(NAME, **_gate_kw(repo, p))
 
 
-def test_final_gate_needs_test_pass_unless_final_alone(tmp_path):
-    res = tmp_path / "results"
+def test_final_gate_refuses_uncommitted_results(repo):
+    p = _register(repo)
+    _stamp(repo, p)
+    _commit_test_result(repo, p)
+    _write_bytes(repo / "results" / "other-test.json", "{}\n")
+    with pytest.raises(FinalGateError, match="uncommitted"):
+        open_final(NAME, **_gate_kw(repo, p))
+
+
+def test_final_gate_needs_matching_committed_test_pass(repo):
+    p = _register(repo)
+    _stamp(repo, p)
     with pytest.raises(FinalGateError, match="Test result"):
-        open_final(NAME, results_dir=res)  # no Test result at all
-    _write_test_result(res, False)
+        open_final(NAME, **_gate_kw(repo, p))  # no Test result at all
+    _commit_test_result(repo, p, passed=False)
     with pytest.raises(FinalGateError, match="passed: false"):
-        open_final(NAME, results_dir=res)
-    assert not (res / f"{NAME}.final_opened").exists()
-    open_final(NAME, final_alone=True, results_dir=res)
-    assert (res / f"{NAME}.final_opened").exists()
+        open_final(NAME, **_gate_kw(repo, p))
+    _commit_test_result(repo, p, prereg_sha256="f" * 64)
+    with pytest.raises(FinalGateError, match="prereg_sha256"):
+        open_final(NAME, **_gate_kw(repo, p))
+    _commit_test_result(repo, p, judge_tree_hash="e" * 40)
+    with pytest.raises(FinalGateError, match="judge_tree_hash"):
+        open_final(NAME, **_gate_kw(repo, p))
+    # Review I2: the stamp must be confirmed after the Test run.
+    _commit_test_result(repo, p, run_utc="2026-06-01T09:00:00Z")
+    with pytest.raises(FinalGateError, match="later than"):
+        open_final(NAME, **_gate_kw(repo, p))
+    assert not (repo / "results" / f"{NAME}.final_opened").exists()
+    _commit_test_result(repo, p)
+    assert open_final(NAME, **_gate_kw(repo, p)) == "opened"
+
+
+def test_final_gate_refuses_tracked_but_edited_test_result(repo):
+    p = _register(repo)
+    _stamp(repo, p)
+    out = _commit_test_result(repo, p, passed=False)
+    out.write_text(out.read_text().replace('"passed": false', '"passed": true'))
+    with pytest.raises(FinalGateError, match="uncommitted|committed"):
+        open_final(NAME, **_gate_kw(repo, p))
+
+
+def test_final_alone_needs_no_test_result(repo, tmp_path):
+    p = _register(repo)
+    assert open_final(NAME, final_alone=True, **_gate_kw(repo, p)) == "opened"
 
 
 def test_final_opened_written_before_data_load(repo, monkeypatch):
     p = _register(repo)
-    _write_test_result(repo / "results", True)
+    _stamp(repo, p)
+    _commit_test_result(repo, p)
     seen = {}
 
     class Stop(Exception):
@@ -219,16 +404,39 @@ def test_final_opened_written_before_data_load(repo, monkeypatch):
 
     monkeypatch.setattr(J, "_load_data", loader)
     with pytest.raises(Stop):
-        run(p, "final", stamp_confirmed=date(2026, 6, 1))
+        run(p, "final")
     assert seen["opened"] is True
-    assert seen["args"] == ("um", date(2026, 6, 2) - timedelta(days=450), date(2026, 8, 30))
+    assert seen["args"] == ("um", FINAL_WIN[0] - timedelta(days=450), FINAL_WIN[1])
+
+
+def test_final_resumes_after_crash_and_records_stamp_source(repo, monkeypatch):
+    # Review I4: a failure after the marker does not burn Final.
+    p = _register(repo)
+    _stamp(repo, p)
+    _commit_test_result(repo, p)
+
+    def crash(*a):
+        raise data.ArchiveFetchError("https://x", 429)
+
+    monkeypatch.setattr(J, "_load_data", crash)
+    with pytest.raises(data.ArchiveFetchError):
+        run(p, "final")
+    monkeypatch.setattr(J, "_load_data", _fake_loader(drift=0.003, calls=[]))
+    out = run(p, "final", stamp_confirmed=STAMP)
+    res = json.loads(out.read_text())
+    assert res["kind"] == "final" and res["window"] == {"start": "2026-06-02", "end": "2026-08-30"}
+    assert res["scored_days"] == 90
+    m = res["manifest"]
+    assert m["stamp_confirmed"] == "2026-06-01" and m["stamp_source"] == "file+flag"
+    assert m["final_gate"] == "resumed"
 
 
 def test_final_kind_must_match_candidate_type(repo, monkeypatch):
     monkeypatch.setattr(J, "_load_data", lambda *a: pytest.fail("data must not load"))
     p = _register(repo)  # Test window 2025-03-20..2026-10-19: not Final-alone
+    _stamp(repo, p)
     with pytest.raises(FinalGateError, match="final_alone"):
-        run(p, "final_alone", stamp_confirmed=date(2026, 6, 1))
+        run(p, "final_alone")
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
 
 
@@ -244,6 +452,7 @@ def _synthetic(start: date, end: date, n_coins=5, drift=0.0, seed=0):
     funding = pd.DataFrame(0.0001, index=days, columns=cols)
     close.attrs["last_date"] = {c: days[-1] for c in cols}
     close.attrs["skipped"] = ["DEADUSDT"]
+    close.attrs["listed_symbols"] = cols + ["DEADUSDT"]
     return close, qv, funding
 
 
@@ -283,11 +492,11 @@ def test_run_writes_result_with_manifest(repo, monkeypatch):
     # Returns scored from the window's first day to its last, inclusive.
     assert res["scored_days"] == (date(2026, 10, 19) - date(2025, 3, 20)).days + 1
     assert 0.0 <= res["luck_odds"] <= 1.0
-    assert 0.0 < res["luck_odds_flip_prob"] < 1.0
     assert set(res["verdict"]) == {"passed", "sharpe", "max_dd", "bench_sharpe", "rules"}
     assert res["passed"] == res["verdict"]["passed"]
     m = res["manifest"]
-    assert m["prereg_sha256"] == hashlib.sha256(p.read_bytes()).hexdigest()
+    blob = subprocess.run(["git", "show", f"HEAD:prereg/{NAME}.json"], cwd=repo, capture_output=True).stdout
+    assert m["prereg_sha256"] == hashlib.sha256(blob).hexdigest()
     assert m["judge_tree_hash"] == _git(repo, "rev-parse", "HEAD:judge")
     assert m["seed"] == 7 and m["n_sims"] == 8
     assert m["pip_freeze"] == ["numpy==0.0-test"]
@@ -295,9 +504,20 @@ def test_run_writes_result_with_manifest(repo, monkeypatch):
     assert m["api_funding_sha256"] == {"C1USDT": data.funding_rows_sha256("C1USDT", [(1_700_000_000_000, 0.0001)])}
     assert m["data_last_date"] == "2026-10-19"
     assert m["skipped_symbols"] == ["DEADUSDT"]
+    assert m["listed_symbols"] == [f"C{i}USDT" for i in range(5)] + ["DEADUSDT"]
     assert m["market"] == "um"
     assert m["window"] == res["window"]
+    assert m["stamp_source"] is None and m["final_gate"] is None
+    assert m["settings"]["cost_per_side"] == 0.0011 and m["settings"]["gross_cap"] == 1.0
+    assert "2025-03-31" in m["universe_by_month"] and isinstance(m["excluded"], dict)
+    assert m["results_git_status"] == []
     assert "lookback" in m["luck_odds_method"]
+    paths = m["luck_odds_paths"]
+    assert [x["lookback"] for x in paths] == [5, 10, 20]
+    for x in paths:
+        assert x["p_short"] == 0.0  # long-only
+        assert x["p_long"] + x["p_flat"] == pytest.approx(1.0)
+        assert 0.0 < x["change_rate"] <= x["flip_prob"] <= 1.0
     assert m["run_utc"].endswith("Z")
     # A result is never overwritten.
     with pytest.raises(J.ResultExists):
@@ -327,29 +547,13 @@ def test_run_refuses_code_outside_prereg_repo(repo, monkeypatch, tmp_path):
 
 def test_cli_final_without_stamp_is_clear_error(repo, capsys):
     p = _register(repo)
-    _write_test_result(repo / "results", True)
+    _commit_test_result(repo, p)
     assert cli_main(["run", str(p), "--kind", "final"]) == 2
     err = capsys.readouterr().err
-    assert "stamp_confirmed" in err and ".stamp_confirmed" in err and "--stamp-confirmed" in err
+    assert "stamp_confirmed" in err and ".stamp_confirmed" in err
+    assert cli_main(["run", str(p), "--kind", "final", "--stamp-confirmed", "2026-06-01"]) == 2
+    assert "only confirm" in capsys.readouterr().err
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
-
-
-def test_stamp_file_wins_and_conflicting_flag_refused(repo):
-    p = _register(repo)
-    stamp = p.with_suffix(".stamp_confirmed")
-    _write_bytes(stamp, "2026-06-01\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "stamp confirmed")
-    assert J.resolve_stamp_confirmed(p, None) == date(2026, 6, 1)
-    assert J.resolve_stamp_confirmed(p, date(2026, 6, 1)) == date(2026, 6, 1)
-    with pytest.raises(PreregError, match="conflict"):
-        J.resolve_stamp_confirmed(p, date(2026, 6, 2))
-    stamp.unlink()
-    assert J.resolve_stamp_confirmed(p, date(2026, 6, 2)) == date(2026, 6, 2)
-    assert J.resolve_stamp_confirmed(p, None) is None
-    _write_bytes(stamp, "2026-06-01\n2026-06-02\n")
-    with pytest.raises(PreregError, match="single"):
-        J.resolve_stamp_confirmed(p, None)
 
 
 def test_cli_test_run_reports_and_exit_code(repo, monkeypatch, capsys):
@@ -358,6 +562,7 @@ def test_cli_test_run_reports_and_exit_code(repo, monkeypatch, capsys):
     assert cli_main(["run", str(p), "--kind", "test"]) == 1  # completed, did not pass
     out = capsys.readouterr().out
     assert "FAILED" in out and f"{NAME}-test.json" in out
+
 
 
 # ---------------------------------------------------------------- data: checksum sidecar

@@ -4,10 +4,10 @@ Exit codes: 0 the run completed and passed, 1 it completed and did not pass
 (the result file is written either way), 2 the judge refused to run
 (integrity, window, Final gate, existing result), 3 a data error.
 
-stamp_confirmed (needed by final and final_alone): the committed companion
-file prereg/NN-name.stamp_confirmed (one ISO date line) wins. --stamp-confirmed
-is used only when that file does not exist, and a flag that disagrees with the
-file is refused.
+stamp_confirmed (needed by final and final_alone) comes only from the committed
+companion file prereg/NN-name.stamp_confirmed (one ISO date line).
+--stamp-confirmed may only confirm it: a flag without the file, or one that
+disagrees with it, is refused.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--kind", required=True, choices=KINDS)
     r.add_argument(
         "--stamp-confirmed", type=_iso_date, default=None, metavar="YYYY-MM-DD",
-        help="Bitcoin-confirmed stamp date, used only if prereg/NN-name.stamp_confirmed does not exist",
+        help="must equal the committed prereg/NN-name.stamp_confirmed (confirmation only)",
     )
     r.add_argument("--cache-dir", type=Path, default=None, help="archive cache (default: <repo>/data_cache)")
     args = parser.parse_args(argv)

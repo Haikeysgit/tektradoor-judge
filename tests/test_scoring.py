@@ -290,35 +290,65 @@ def test_luck_odds_deterministic_with_new_settings():
     assert luck_odds(close, funding, uni, kind="test", n_sims=20, bench=bench, **odds_kw) == p
 
 
-# ---------------------------------------------------------------- flip_prob correction (Task 7 ruling 2 follow-up)
+# ---------------------------------------------------------------- sim paths mirror the candidate (review I6)
 
-from judge.judge import _random_states, flip_prob_for_rate, observed_flip_prob  # noqa: E402
-from judge.strategies.donchian import signal  # noqa: E402
+from judge.judge import _random_states, flip_prob_for_rate, observed_path_models, sim_path_args  # noqa: E402
+from judge.strategies.donchian import _allocation_frame, signal  # noqa: E402
+
+
+def test_flip_prob_for_rate():
+    assert flip_prob_for_rate(0.04, [0.5, 0.5]) == pytest.approx(0.08)  # uniform: k/(k-1)
+    assert flip_prob_for_rate(0.04, [1 / 3] * 3) == pytest.approx(0.06)
+    assert flip_prob_for_rate(0.03, [0.75, 0.25]) == pytest.approx(0.03 / (1 - 0.625))
+    assert flip_prob_for_rate(0.9, [0.5, 0.5]) == 1.0  # capped
+    assert flip_prob_for_rate(0.0, [1.0, 0.0]) == 0.0  # never leaves its state
+
+
+def _long_market(n_coins=12, n_days=3000, seed=21):
+    days = pd.date_range("2015-01-01", periods=n_days, freq="D")
+    rng = np.random.default_rng(seed)
+    close = pd.DataFrame(100 * np.cumprod(1 + 0.03 * rng.standard_normal((n_days, n_coins)), axis=0),
+                         index=days, columns=[f"C{i:02d}USDT" for i in range(n_coins)])
+    months = pd.date_range(days[0] - pd.Timedelta(days=31), days[-1], freq="ME")
+    uni = {m.date(): list(close.columns) for m in months}
+    excluded = {d.date(): {close.columns[0]} for d in pd.date_range("2018-03-01", "2018-08-31")}
+    win = (days[400].date(), days[-1].date())
+    return close, uni, excluded, win
 
 
 @pytest.mark.parametrize("long_short", [False, True])
-def test_sim_path_change_rate_matches_target(long_short):
+def test_sim_paths_match_candidate_exposure_and_change_rate(long_short):
+    close, uni, excluded, win = _long_market()
+    lbs = (5, 20, 60)
+    models = observed_path_models(close, uni, excluded, lbs, long_short, win)
+
+    # The candidate's own numbers, on active decision days start-1 .. end-1.
+    active = _allocation_frame(close, uni, excluded)[0].to_numpy(dtype=bool)
+    idx = close.index
+    in_win = (idx >= pd.Timestamp(win[0]) - pd.Timedelta(days=1)) & (idx <= pd.Timestamp(win[1]) - pd.Timedelta(days=1))
+    mask = active & np.asarray(in_win)[:, None]
+    assert not mask[:, 0].all()  # the exclusion is in the mask
+
     states = np.array([-1, 0, 1] if long_short else [0, 1])
-    target = 0.04
-    p = flip_prob_for_rate(target, len(states))
-    assert p == pytest.approx(target * len(states) / (len(states) - 1))
-    paths = _random_states(np.random.default_rng(0), (200_000, 4), p, states)
-    prev = np.vstack([np.zeros((1, 4)), paths[:-1]])
-    realised = (paths != prev).mean()
-    assert realised == pytest.approx(target, rel=0.03)
-    assert flip_prob_for_rate(0.9, 2) == 1.0  # capped
+    flips, probs = sim_path_args(models, long_short)
+    rng = np.random.default_rng(0)
+    combo_cand = np.zeros(close.shape)
+    for m, n, f, p in zip(models, lbs, flips, probs):
+        pos = np.column_stack([signal(close[c], n, long_short).to_numpy() for c in close.columns]).astype(float)
+        combo_cand += pos / len(lbs)
+        prev = np.vstack([np.zeros((1, pos.shape[1])), pos[:-1]])
+        cand_rate = (pos != prev)[mask].mean()
+        cand_exposure = pos[mask].mean()
+        assert m["change_rate"] == pytest.approx(cand_rate)
+        assert m["p_long"] - m["p_short"] == pytest.approx(cand_exposure)
+        assert m["p_flat"] == pytest.approx((pos[mask] == 0).mean())
 
+        path = _random_states(rng, close.shape, f, states, p)
+        prev = np.vstack([np.zeros((1, path.shape[1])), path[:-1]])
+        assert (path != prev)[mask].mean() == pytest.approx(cand_rate, rel=0.10)
+        assert path[mask].mean() == pytest.approx(cand_exposure, abs=0.05)
+        assert np.abs(path)[mask].mean() == pytest.approx(np.abs(pos)[mask].mean(), abs=0.05)
 
-def test_observed_flip_prob_applies_correction():
-    close, _, uni = _luck_inputs()
-    lbs = (5, 20)
-    win = (date(2024, 3, 1), date(2024, 11, 30))
-    days = (close.index >= pd.Timestamp(win[0])) & (close.index <= pd.Timestamp(win[1]))
-    for ls, k in ((False, 2), (True, 3)):
-        changes = sum(
-            int(((signal(close[c], n, ls) != signal(close[c], n, ls).shift(fill_value=0)) & days).sum())
-            for n in lbs for c in close.columns
-        )
-        rate = changes / (int(days.sum()) * close.shape[1] * len(lbs))
-        got = observed_flip_prob(close, uni, None, lbs, ls, win)
-        assert got == pytest.approx(min(1.0, rate * k / (k - 1)))
+    sim_state = luck_sims(close, None, uni, long_short, flips, 1, 3, 0.0, None,
+                          state_probs=probs, lookbacks=lbs, excluded=excluded, return_states=True)[0]
+    assert sim_state.to_numpy()[mask].mean() == pytest.approx(combo_cand[mask].mean(), abs=0.05)
