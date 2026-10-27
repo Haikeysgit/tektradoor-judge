@@ -12,4 +12,4 @@ jobs:
           python-version: "3.11"
       - run: pip install --require-hashes -r requirements.txt
       - run: python scripts/check_no_secrets.py
-      - run: pytest -q
+      - run: python -m pytest -q
