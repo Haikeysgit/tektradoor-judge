@@ -343,6 +343,42 @@ def daily_klines(symbol: str, market: Market, start: date, end: date, cache_dir:
 FUNDING_COLS = ["calc_time", "funding_interval_hours", "last_funding_rate"]
 
 
+_api_funding_recorders: list[dict[str, list[tuple[int, float]]]] = []
+
+
+@contextmanager
+def record_api_funding():
+    """Collect {symbol: [(funding_time_ms, rate), ...]} for every row fetched
+    from the live fapi (months with no funding archive) inside the block.
+    These rows have no archive checksum; the judge hashes them instead
+    (funding_rows_sha256)."""
+    rec: dict[str, list[tuple[int, float]]] = {}
+    _api_funding_recorders.append(rec)
+    try:
+        yield rec
+    finally:
+        _api_funding_recorders[:] = [r for r in _api_funding_recorders if r is not rec]
+
+
+def note_api_funding(symbol: str, rows) -> None:
+    """Report API funding rows (time_ms, rate) to every active record_api_funding block."""
+    rows = [(int(t), float(r)) for t, r in rows]
+    for rec in _api_funding_recorders:
+        rec.setdefault(symbol, []).extend(rows)
+
+
+def funding_rows_sha256(symbol: str, rows) -> str:
+    """sha256 of a canonical CSV of API funding rows.
+
+    Format: header ``symbol,time,rate``, then one ``symbol,time_ms,repr(float(rate))``
+    line per distinct row, sorted by (time, rate), LF line ends, trailing LF,
+    UTF-8. Row order and duplicates do not change the hash.
+    """
+    distinct = sorted({(int(t), float(r)) for t, r in rows})
+    lines = ["symbol,time,rate"] + [f"{symbol},{t},{r!r}" for t, r in distinct]
+    return hashlib.sha256(("\n".join(lines) + "\n").encode("utf-8")).hexdigest()
+
+
 def _funding_from_api(symbol: str, m: date) -> pd.Series:
     start_ms = int(datetime(m.year, m.month, 1, tzinfo=timezone.utc).timestamp() * 1000)
     nm = date(m.year + (m.month == 12), m.month % 12 + 1, 1)
@@ -364,6 +400,7 @@ def _funding_from_api(symbol: str, m: date) -> pd.Series:
         if len(rows) < 1000:
             break
         cursor = int(rows[-1]["fundingTime"]) + 1
+    note_api_funding(symbol, zip(times, rates))
     return pd.Series(rates, index=pd.Index(times, dtype="int64"), dtype="float64")
 
 

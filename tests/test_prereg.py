@@ -256,6 +256,7 @@ def _fake_loader(drift, calls, seed=0):
         z.write_bytes(b"zip")
         data.checksum_path(z).write_text(f"{'ab' * 32}  x.zip\n")
         data.note_fetch(z)
+        data.note_api_funding("C1USDT", [(1_700_000_000_000, 0.0001)])
         return _synthetic(start, end, drift=drift, seed=seed)
     return loader
 
@@ -291,6 +292,7 @@ def test_run_writes_result_with_manifest(repo, monkeypatch):
     assert m["seed"] == 7 and m["n_sims"] == 8
     assert m["pip_freeze"] == ["numpy==0.0-test"]
     assert m["archive_checksums"] == {"data.binance.vision/data/futures/um/x.zip": "ab" * 32}
+    assert m["api_funding_sha256"] == {"C1USDT": data.funding_rows_sha256("C1USDT", [(1_700_000_000_000, 0.0001)])}
     assert m["data_last_date"] == "2026-10-19"
     assert m["skipped_symbols"] == ["DEADUSDT"]
     assert m["market"] == "um"

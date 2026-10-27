@@ -12,7 +12,7 @@ python -m judge run prereg/01-name.json --kind final        # after a Test pass
 python -m judge run prereg/01-name.json --kind final_alone  # Test window under 12 months
 ```
 
-Each run writes `results/{candidate_id}-{kind}.json`, pass or fail, with a manifest (archive checksums, prereg sha256, judge tree hash, seed, `pip freeze`, run time). Results are never overwritten, and Final opens once. See `prereg/README.md` for the files each candidate needs.
+Each run writes `results/{candidate_id}-{kind}.json`, pass or fail, with a manifest (archive checksums, prereg sha256, judge tree hash, seed, `pip freeze`, run time). Results are never overwritten, and Final opens once. `results/` is committed: it is the record, so it is deliberately not gitignored; commit each result file (and any `.final_opened` marker) right after its run. See `prereg/README.md` for the files each candidate needs.
 
 ## Development
 

@@ -5,3 +5,6 @@ Build the live, unfakeable public record (requirements R2-1..R2-15 in the spec).
 
 ## TODO-2: Darwinex Zero check after a Test pass
 After any candidate passes Test, check whether a Darwinex Zero track record is a viable independent verification route before going live.
+
+## TODO-3: Final gate consumed on short data
+Final opened marker is consumed even if data turns out short; mitigated by the window-end ≥3-days-old check.

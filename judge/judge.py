@@ -135,8 +135,10 @@ LUCK_ODDS_METHOD = (
     "per lookback (one path for each of the candidate's lookbacks) and averages them, as the "
     "combo averages its lookback signals. A path starts at 0; each day, with probability "
     "flip_prob, it redraws its state uniformly from {0,1} (long-only) or {-1,0,1} (long-short), "
-    "possibly the same state. flip_prob is the candidate's own signal change rate: changes "
-    "summed over lookbacks divided by (lookbacks x active coin-days) inside the window. Coin "
+    "possibly the same state. The target rate is the candidate's own signal change rate: changes "
+    "summed over lookbacks divided by (lookbacks x active coin-days) inside the window. A redraw "
+    "keeps the state with probability 1/k (k states), so flip_prob = rate x k/(k-1), capped at 1, "
+    "which makes each path change state at the candidate's observed rate. Coin "
     "weight = vol_scale(vol_target, vol_window, per_coin_cap) x mean state, then the "
     "candidate's allocation (monthly universe, daily exit exclusions, delisting, gross cap), "
     "its rebalance threshold (a path state change counts as a signal change), costs and "
@@ -259,6 +261,17 @@ def luck_odds(
     return sum(verdict(s, bench, kind)["passed"] for s in sims) / n_sims
 
 
+def flip_prob_for_rate(rate: float, n_states: int) -> float:
+    """flip_prob at which a _random_states path changes state at ``rate``.
+
+    A flip redraws uniformly from n_states states, so it changes the state
+    with probability (k-1)/k; hence flip_prob = rate * k/(k-1), capped at 1.
+    """
+    if n_states < 2:
+        return 0.0
+    return float(min(1.0, rate * n_states / (n_states - 1)))
+
+
 def observed_flip_prob(
     close: pd.DataFrame,
     universe_by_month: dict,
@@ -267,8 +280,10 @@ def observed_flip_prob(
     long_short: bool,
     window: Window,
 ) -> float:
-    """The candidate's mean daily signal change rate per lookback per active
-    coin-day inside the window (decision days start..end); 0 if none active."""
+    """flip_prob that makes each sim path change state as often as one of the
+    candidate's lookback signals did: the mean daily change rate per lookback
+    per active coin-day inside the window (decision days start..end), through
+    flip_prob_for_rate. 0 if no coin-day is active."""
     active, _, _ = _allocation_frame(close, universe_by_month, excluded)
     idx = close.index
     in_win = np.asarray((idx >= pd.Timestamp(window[0])) & (idx <= pd.Timestamp(window[1])))
@@ -282,7 +297,7 @@ def observed_flip_prob(
             pos = signal(close[c], n, long_short)
             moved = (pos != pos.shift(fill_value=0)).to_numpy(dtype=bool)
             changes += int((moved & mask[:, j]).sum())
-    return changes / (coin_days * len(lookbacks))
+    return flip_prob_for_rate(changes / (coin_days * len(lookbacks)), 3 if long_short else 2)
 
 
 # ---------------------------------------------------------------- pre-registration
@@ -626,7 +641,7 @@ def run(
         open_final(cid, final_alone=kind == "final_alone", results_dir=results_dir)
 
     load_start = win[0] - timedelta(days=LOOKBACK_DAYS)
-    with data.record_fetches() as fetched:
+    with data.record_fetches() as fetched, data.record_api_funding() as api_funding:
         close, qv, funding = _load_data(MARKET, load_start, win[1], cache_dir)
     last = _data_last_date(close)
     if last < win[1]:
@@ -701,6 +716,9 @@ def run(
             },
             "luck_odds_method": LUCK_ODDS_METHOD,
             "archive_checksums": checksums,
+            "api_funding_sha256": {
+                sym: data.funding_rows_sha256(sym, rows) for sym, rows in sorted(api_funding.items())
+            },
             "python": sys.version,
             "pip_freeze": freeze,
         },

@@ -288,3 +288,37 @@ def test_luck_odds_deterministic_with_new_settings():
     assert p == luck_odds(close, funding, uni, kind="test", n_sims=20, **odds_kw)
     bench = benchmark_returns(close, funding, uni, C, excluded=excluded, window=kw["window"])
     assert luck_odds(close, funding, uni, kind="test", n_sims=20, bench=bench, **odds_kw) == p
+
+
+# ---------------------------------------------------------------- flip_prob correction (Task 7 ruling 2 follow-up)
+
+from judge.judge import _random_states, flip_prob_for_rate, observed_flip_prob  # noqa: E402
+from judge.strategies.donchian import signal  # noqa: E402
+
+
+@pytest.mark.parametrize("long_short", [False, True])
+def test_sim_path_change_rate_matches_target(long_short):
+    states = np.array([-1, 0, 1] if long_short else [0, 1])
+    target = 0.04
+    p = flip_prob_for_rate(target, len(states))
+    assert p == pytest.approx(target * len(states) / (len(states) - 1))
+    paths = _random_states(np.random.default_rng(0), (200_000, 4), p, states)
+    prev = np.vstack([np.zeros((1, 4)), paths[:-1]])
+    realised = (paths != prev).mean()
+    assert realised == pytest.approx(target, rel=0.03)
+    assert flip_prob_for_rate(0.9, 2) == 1.0  # capped
+
+
+def test_observed_flip_prob_applies_correction():
+    close, _, uni = _luck_inputs()
+    lbs = (5, 20)
+    win = (date(2024, 3, 1), date(2024, 11, 30))
+    days = (close.index >= pd.Timestamp(win[0])) & (close.index <= pd.Timestamp(win[1]))
+    for ls, k in ((False, 2), (True, 3)):
+        changes = sum(
+            int(((signal(close[c], n, ls) != signal(close[c], n, ls).shift(fill_value=0)) & days).sum())
+            for n in lbs for c in close.columns
+        )
+        rate = changes / (int(days.sum()) * close.shape[1] * len(lbs))
+        got = observed_flip_prob(close, uni, None, lbs, ls, win)
+        assert got == pytest.approx(min(1.0, rate * k / (k - 1)))
