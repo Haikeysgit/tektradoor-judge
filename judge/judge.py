@@ -657,12 +657,44 @@ def resolve_stamp_confirmed(prereg_path: Path, flag: date | None) -> tuple[date 
     return from_file, ("file+flag" if flag is not None else "file")
 
 
+def prereg_first_commit_date(prereg_path: Path) -> date:
+    """Committer date (%cs, the committer's own timezone) of the oldest commit that added the prereg."""
+    path = Path(prereg_path).resolve()
+    root = _repo_root(path.parent)
+    rel = path.relative_to(root).as_posix()
+    dates = _git(root, "log", "--diff-filter=A", "--format=%cs", "--", rel).split()
+    if not dates:
+        raise PreregMismatch(f"{rel} has no commit that added it")
+    return date.fromisoformat(dates[-1])  # git log lists newest first
+
+
+def check_stamp(prereg_path: Path, stamp_confirmed: date) -> None:
+    """Refuse a stamp date that could put Final on already-seen data.
+
+    (a) The Final window start (stamp + 1 day) must be after the Test window
+        end (TEST_END), so Final never overlaps Test.
+    (b) The stamp date must be on or after the prereg's first commit date: a
+        stamp cannot be confirmed before the file it stamps was committed.
+    """
+    start = stamp_confirmed + timedelta(days=1)
+    if not start > TEST_END:
+        raise FinalGateError(
+            f"stamp_confirmed {stamp_confirmed} puts the Final start ({start}) on or before the end of "
+            f"the Test window ({TEST_END}); Final must start after the Test window"
+        )
+    first = prereg_first_commit_date(prereg_path)
+    if stamp_confirmed < first:
+        raise FinalGateError(
+            f"stamp_confirmed {stamp_confirmed} is before the prereg's first commit ({first}); "
+            "a stamp cannot predate the file it stamps"
+        )
+
+
 def _window_json(win: Window) -> dict:
     return {"start": win[0].isoformat(), "end": win[1].isoformat()}
 
 
-def _check_test_pass(root: Path, rd: Path, candidate_id: str, prereg_sha256: str, judge_tree_hash: str,
-                     stamp_confirmed: date | None) -> None:
+def _check_test_pass(root: Path, rd: Path, candidate_id: str, prereg_sha256: str, judge_tree_hash: str) -> None:
     test_file = rd / f"{candidate_id}-test.json"
     if not test_file.exists():
         raise FinalGateError(f"no Test result {test_file.name}: Final opens only after a committed Test pass")
@@ -684,16 +716,6 @@ def _check_test_pass(root: Path, rd: Path, candidate_id: str, prereg_sha256: str
         raise FinalGateError(
             f"{test_file.name} was run by other judge code: judge_tree_hash {m.get('judge_tree_hash')} vs current {judge_tree_hash}"
         )
-    if stamp_confirmed is not None:
-        try:
-            ran = datetime.strptime(str(m.get("run_utc")), "%Y-%m-%dT%H:%M:%SZ").date()
-        except ValueError as exc:
-            raise FinalGateError(f"{test_file.name}: unreadable run_utc {m.get('run_utc')!r}") from exc
-        if not stamp_confirmed > ran:
-            raise FinalGateError(
-                f"stamp_confirmed {stamp_confirmed} must be later than the Test run ({m.get('run_utc')}), "
-                "so the Final window holds only data unseen at Test time"
-            )
 
 
 def open_final(
@@ -702,7 +724,6 @@ def open_final(
     prereg_sha256: str,
     judge_tree_hash: str,
     window: Window,
-    stamp_confirmed: date | None = None,
     final_alone: bool = False,
     results_dir: Path | None = None,
 ) -> str:
@@ -713,8 +734,7 @@ def open_final(
       * results/ has uncommitted changes, other than this candidate's own
         marker when resuming;
       * unless Final-alone: there is no committed, unmodified Test result for
-        this prereg_sha256 and judge_tree_hash that says passed: true, or the
-        stamp date is not later than that Test run's date;
+        this prereg_sha256 and judge_tree_hash that says passed: true;
       * a marker exists that does not match (prereg_sha256, judge_tree_hash, window).
     Writes results/{id}.final_opened holding those three and returns "opened";
     with a matching marker and no Final result it returns "resumed" (the run
@@ -736,7 +756,7 @@ def open_final(
     if others:
         raise FinalGateError(f"uncommitted changes under results/: {', '.join(ln[3:] for ln in others)}; commit earlier results first")
     if not final_alone:
-        _check_test_pass(root, rd, candidate_id, prereg_sha256, judge_tree_hash, stamp_confirmed)
+        _check_test_pass(root, rd, candidate_id, prereg_sha256, judge_tree_hash)
     expected = {"prereg_sha256": prereg_sha256, "judge_tree_hash": judge_tree_hash, "window": _window_json(window)}
     if resuming:
         try:
@@ -868,6 +888,8 @@ def run(
         raise FinalGateError(f"{cid} has a Test window of 12 months or more: run --kind final after a Test pass, not final_alone")
     stamp, stamp_source = resolve_stamp_confirmed(path, stamp_confirmed) if kind in FINAL_KINDS else (None, None)
     win = window(kind, prereg, stamp)
+    if kind in FINAL_KINDS:
+        check_stamp(path, stamp)
     prereg_sha = committed_sha256(path)
     tree_hash = _git(root, "rev-parse", "HEAD:judge")
     git_head = _git(root, "rev-parse", "HEAD")
@@ -878,7 +900,7 @@ def run(
     gate = None
     if kind in FINAL_KINDS:
         gate = open_final(cid, prereg_sha256=prereg_sha, judge_tree_hash=tree_hash, window=win,
-                          stamp_confirmed=stamp, final_alone=kind == "final_alone", results_dir=results_dir)
+                          final_alone=kind == "final_alone", results_dir=results_dir)
 
     load_start = win[0] - timedelta(days=LOOKBACK_DAYS)
     with data.record_fetches() as fetched, data.record_api_funding() as api_funding:

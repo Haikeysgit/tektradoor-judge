@@ -1,6 +1,7 @@
 """Task 7: pre-registration guard, windows, Final gate, result file, CLI."""
 import hashlib
 import json
+import os
 import subprocess
 from datetime import date, timedelta
 from pathlib import Path
@@ -25,15 +26,19 @@ from judge.judge import (
 )
 
 NAME = "01-demo-long"
-STAMP = date(2026, 6, 1)
-FINAL_WIN = (date(2026, 6, 2), date(2026, 8, 30))
-TEST_RUN_UTC = "2026-05-20T10:00:00Z"
+COMMIT_DATE = "2026-10-20T12:00:00+00:00"  # every test commit, so first-commit dates are fixed
+STAMP = date(2026, 10, 25)
+FINAL_WIN = (date(2026, 10, 26), date(2027, 1, 23))
+FINAL_WIN_JSON = {"start": "2026-10-26", "end": "2027-01-23"}
+TODAY = date(2027, 3, 1)  # Final data for FINAL_WIN exists
+TEST_RUN_UTC = "2026-10-27T10:00:00Z"  # after the stamp: allowed
 
 
 def _git(repo: Path, *args: str) -> str:
     res = subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args],
         cwd=repo, capture_output=True, text=True, check=True,
+        env={**os.environ, "GIT_AUTHOR_DATE": COMMIT_DATE, "GIT_COMMITTER_DATE": COMMIT_DATE},
     )
     return res.stdout.strip()
 
@@ -104,7 +109,6 @@ def _gate_kw(repo: Path, p: Path, **over) -> dict:
         prereg_sha256=hashlib.sha256(p.read_bytes()).hexdigest(),
         judge_tree_hash=_git(repo, "rev-parse", "HEAD:judge"),
         window=FINAL_WIN,
-        stamp_confirmed=STAMP,
         results_dir=repo / "results",
     )
     kw.update(over)
@@ -123,6 +127,7 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setattr(J, "CODE_ROOT", root)
     monkeypatch.setattr(J, "_pip_freeze", lambda: ["numpy==0.0-test"])
     monkeypatch.setitem(J.JUDGING, "n_sims", 8)  # keep run() tests fast
+    monkeypatch.setattr(J, "_today_utc", lambda: TODAY)
     return root
 
 
@@ -279,12 +284,12 @@ def test_test_window_starts_after_paper_sample():
 def test_final_needs_stamp_and_full_data():
     pre = _prereg_dict()
     with pytest.raises(FinalNotReady, match="stamp_confirmed"):
-        window("final", pre, None, latest_data_date=date(2026, 10, 20))
+        window("final", pre, None, latest_data_date=TODAY)
     # 90 days starting the day after the stamp date.
-    assert window("final", pre, STAMP, latest_data_date=date(2026, 10, 20)) == FINAL_WIN
-    assert window("final_alone", pre, STAMP, latest_data_date=date(2026, 8, 30))[1] == date(2026, 8, 30)
-    with pytest.raises(FinalNotReady, match="2026-08-29"):
-        window("final", pre, STAMP, latest_data_date=date(2026, 8, 29))
+    assert window("final", pre, STAMP, latest_data_date=TODAY) == FINAL_WIN
+    assert window("final_alone", pre, STAMP, latest_data_date=FINAL_WIN[1])[1] == FINAL_WIN[1]
+    with pytest.raises(FinalNotReady, match="2027-01-22"):
+        window("final", pre, STAMP, latest_data_date=date(2027, 1, 22))
 
 
 # ---------------------------------------------------------------- stamp_confirmed
@@ -299,14 +304,14 @@ def test_final_needs_committed_stamp_file_flag_only_confirms(repo):
     assert J.resolve_stamp_confirmed(p, STAMP) == (STAMP, "file+flag")
     with pytest.raises(PreregError, match="conflict"):
         J.resolve_stamp_confirmed(p, STAMP + timedelta(days=1))
-    _write_bytes(p.with_suffix(".stamp_confirmed"), "2026-06-01\n2026-06-02\n")
+    _write_bytes(p.with_suffix(".stamp_confirmed"), "2026-10-25\n2026-10-26\n")
     with pytest.raises(PreregError, match="single"):
         J.resolve_stamp_confirmed(p, None)
 
 
 def test_uncommitted_stamp_file_refused(repo):
     p = _register(repo)
-    _write_bytes(p.with_suffix(".stamp_confirmed"), "2026-06-01\n")
+    _write_bytes(p.with_suffix(".stamp_confirmed"), "2026-10-25\n")
     with pytest.raises(PreregMismatch):
         check_integrity(p)
 
@@ -320,11 +325,11 @@ def test_second_final_open_refused(repo):
     assert open_final(NAME, **_gate_kw(repo, p)) == "opened"
     marker = repo / "results" / f"{NAME}.final_opened"
     rec = json.loads(marker.read_text())
-    assert rec["window"] == {"start": "2026-06-02", "end": "2026-08-30"}
+    assert rec["window"] == FINAL_WIN_JSON
     assert rec["prereg_sha256"] == hashlib.sha256(p.read_bytes()).hexdigest()
     # A different window (or prereg or judge) is a second opening: refused.
     with pytest.raises(FinalGateError, match="does not match"):
-        open_final(NAME, **_gate_kw(repo, p, window=(date(2026, 7, 2), date(2026, 9, 29))))
+        open_final(NAME, **_gate_kw(repo, p, window=(date(2026, 10, 27), date(2027, 1, 24))))
     # Same marker, no result: resume.
     assert open_final(NAME, **_gate_kw(repo, p)) == "resumed"
 
@@ -364,10 +369,6 @@ def test_final_gate_needs_matching_committed_test_pass(repo):
         open_final(NAME, **_gate_kw(repo, p))
     _commit_test_result(repo, p, judge_tree_hash="e" * 40)
     with pytest.raises(FinalGateError, match="judge_tree_hash"):
-        open_final(NAME, **_gate_kw(repo, p))
-    # Review I2: the stamp must be confirmed after the Test run.
-    _commit_test_result(repo, p, run_utc="2026-06-01T09:00:00Z")
-    with pytest.raises(FinalGateError, match="later than"):
         open_final(NAME, **_gate_kw(repo, p))
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
     _commit_test_result(repo, p)
@@ -424,11 +425,38 @@ def test_final_resumes_after_crash_and_records_stamp_source(repo, monkeypatch):
     monkeypatch.setattr(J, "_load_data", _fake_loader(drift=0.003, calls=[]))
     out = run(p, "final", stamp_confirmed=STAMP)
     res = json.loads(out.read_text())
-    assert res["kind"] == "final" and res["window"] == {"start": "2026-06-02", "end": "2026-08-30"}
+    assert res["kind"] == "final" and res["window"] == FINAL_WIN_JSON
     assert res["scored_days"] == 90
     m = res["manifest"]
-    assert m["stamp_confirmed"] == "2026-06-01" and m["stamp_source"] == "file+flag"
+    assert m["stamp_confirmed"] == "2026-10-25" and m["stamp_source"] == "file+flag"
     assert m["final_gate"] == "resumed"
+
+
+def test_final_window_must_start_after_test_window(repo, monkeypatch):
+    # Amended I2 (a): stamp + 1 day must be after 2026-10-19.
+    monkeypatch.setattr(J, "_load_data", lambda *a: pytest.fail("data must not load"))
+    p = _register(repo)
+    _commit_test_result(repo, p)
+    J.check_stamp(p, date(2026, 10, 20))
+    with pytest.raises(FinalGateError, match="after the Test window"):
+        J.check_stamp(p, date(2026, 10, 18))  # Final would start 2026-10-19
+    _stamp(repo, p, date(2026, 10, 1))
+    with pytest.raises(FinalGateError, match="after the Test window"):
+        run(p, "final")
+    assert not (repo / "results" / f"{NAME}.final_opened").exists()
+
+
+def test_stamp_not_before_prereg_first_commit(repo):
+    # Amended I2 (b): the stamp cannot predate the prereg's first commit (2026-10-20 here).
+    p = _register(repo)
+    J.check_stamp(p, date(2026, 10, 20))  # same day: allowed
+    with pytest.raises(FinalGateError, match="first commit"):
+        J.check_stamp(p, date(2026, 10, 19))  # passes (a), fails (b)
+    # A later commit of the prereg does not move its first-commit date.
+    p.write_bytes(p.read_bytes().replace(b'"seed": 7', b'"seed": 9'))
+    _commit(repo, "later edit")
+    with pytest.raises(FinalGateError, match="2026-10-20"):
+        J.check_stamp(p, date(2026, 10, 19))
 
 
 def test_final_kind_must_match_candidate_type(repo, monkeypatch):
@@ -551,7 +579,7 @@ def test_cli_final_without_stamp_is_clear_error(repo, capsys):
     assert cli_main(["run", str(p), "--kind", "final"]) == 2
     err = capsys.readouterr().err
     assert "stamp_confirmed" in err and ".stamp_confirmed" in err
-    assert cli_main(["run", str(p), "--kind", "final", "--stamp-confirmed", "2026-06-01"]) == 2
+    assert cli_main(["run", str(p), "--kind", "final", "--stamp-confirmed", "2026-10-25"]) == 2
     assert "only confirm" in capsys.readouterr().err
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
 

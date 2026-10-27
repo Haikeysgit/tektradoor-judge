@@ -42,4 +42,4 @@ Any failure names the file and both hashes. Editing a prereg after registration 
 
 ## stamp_confirmed
 
-Final reads the date only from the committed `NN-name.stamp_confirmed`. `--stamp-confirmed YYYY-MM-DD` can only confirm it: a flag without the file, or one that disagrees with it, is refused. The manifest records `stamp_source` (`file` or `file+flag`). The stamp date must be later than the committed Test result's run date, so the Final window holds only data that did not exist at Test time.
+Final reads the date only from the committed `NN-name.stamp_confirmed`. `--stamp-confirmed YYYY-MM-DD` can only confirm it: a flag without the file, or one that disagrees with it, is refused. The manifest records `stamp_source` (`file` or `file+flag`). The judge refuses a stamp date unless (a) the Final start (stamp + 1 day) is after the Test window end (2026-10-19), and (b) the stamp date is on or after the prereg's first commit date (`git log --diff-filter=A --format=%cs`, oldest).
