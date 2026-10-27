@@ -109,7 +109,8 @@ def _commit_repro_pass(repo: Path, p: Path) -> Path:
     params = load_prereg(p)
     out = repo / "results" / f"{params['candidate_id']}-repro.json"
     rec = {"candidate_id": params["candidate_id"], "kind": "repro", "passed": True,
-           "strategy_sha256": J.strategy_sha256(params)}
+           "strategy_sha256": J.strategy_sha256(params),
+           "manifest": {"judge_tree_hash": _git(repo, "rev-parse", "HEAD:judge")}}
     _write_bytes(out, json.dumps(rec) + "\n")
     _commit(repo, "repro result")
     return out

@@ -999,11 +999,46 @@ def repro_returns(
     return net_returns(weights, changed, frame, None, cost_per_side, rebalance_threshold)
 
 
+# judge/ paths whose code decides the strategy's returns: a reproduction only
+# vouches for these exact blobs.
+REPRO_CODE_PATHS = ("strategies/", "costs.py")
+
+
+def _tree_code_blobs(root: Path, tree: str) -> dict[str, str]:
+    """{path: blob sha} of REPRO_CODE_PATHS inside a judge tree (git ls-tree -r)."""
+    res = _git_run(root, "ls-tree", "-r", tree)
+    if res.returncode != 0:
+        raise ReproGateError(
+            f"judge tree {tree} (a recorded judge_tree_hash) is not in this repository: {res.stderr.decode(errors='replace').strip()}"
+        )
+    out = {}
+    for line in res.stdout.decode("utf-8").splitlines():
+        meta, _, path = line.partition("\t")
+        if path == "costs.py" or path.startswith("strategies/"):
+            out[path] = meta.split()[2]
+    return out
+
+
+def check_repro_code(root: Path, repro_tree: str) -> None:
+    """Refuse unless strategies/ (every file) and costs.py in the repro's
+    judge tree have the same blobs as in the current HEAD:judge."""
+    then = _tree_code_blobs(root, repro_tree)
+    now = _tree_code_blobs(root, _git(root, "rev-parse", "HEAD:judge"))
+    changed = sorted(p for p in set(then) | set(now) if then.get(p) != now.get(p))
+    if changed:
+        raise ReproGateError(
+            "strategy or cost code changed since reproduction; rerun reproduce "
+            f"(judge tree {repro_tree} vs HEAD:judge, differing: {', '.join('judge/' + p for p in changed)})"
+        )
+
+
 def check_repro_pass(root: Path, rd: Path, prereg: dict) -> dict:
     """Refuse (ReproGateError) unless results/{id}-repro.json is committed and
-    unmodified, is this candidate's repro result, says passed: true, and its
-    strategy_sha256 equals the one computed from ``prereg``.
-    Returns {"path", "strategy_sha256"} for the manifest."""
+    unmodified, is this candidate's repro result, says passed: true, its
+    strategy_sha256 equals the one computed from ``prereg``, and the strategy
+    and cost code (REPRO_CODE_PATHS) in its recorded judge_tree_hash equals
+    the code in HEAD:judge (check_repro_code).
+    Returns {"path", "strategy_sha256", "judge_tree_hash"} for the manifest."""
     cid = prereg["candidate_id"]
     root = Path(root).resolve()
     f = Path(rd).resolve() / f"{cid}-repro.json"
@@ -1027,7 +1062,12 @@ def check_repro_pass(root: Path, rd: Path, prereg: dict) -> dict:
         raise ReproGateError(
             f"{rel} reproduced other rules: strategy_sha256 {res.get('strategy_sha256')} vs this prereg's {expected}"
         )
-    return {"path": rel, "strategy_sha256": expected}
+    manifest = res.get("manifest")
+    tree = manifest.get("judge_tree_hash") if isinstance(manifest, dict) else None
+    if not isinstance(tree, str) or not TREE_HASH_RE.match(tree):
+        raise ReproGateError(f"{rel} has no manifest.judge_tree_hash recording the code that reproduced")
+    check_repro_code(root, tree)
+    return {"path": rel, "strategy_sha256": expected, "judge_tree_hash": tree}
 
 
 def reproduce(

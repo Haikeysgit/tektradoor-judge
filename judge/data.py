@@ -600,11 +600,18 @@ def price_series_sha256(series: pd.Series) -> str:
 
 
 def note_api_price(name: str, series: pd.Series) -> None:
-    """Report a price series to every active record_api_prices block."""
+    """Report a price series to every active record_api_prices block.
+
+    Names must be unique per series (exchange_daily puts the date range in
+    them); the same name with a different hash raises DataIntegrityError
+    rather than overwrite the first one.
+    """
     if not _api_price_recorders:
         return
     sha = price_series_sha256(series)
     for rec in _api_price_recorders:
+        if rec.get(name, sha) != sha:
+            raise DataIntegrityError(f"api price series {name} reported twice with different hashes")
         rec[name] = sha
 
 
@@ -758,21 +765,24 @@ def exchange_daily(asset: Literal["BTC", "ETH"], start: date, end: date, cache_d
     Each source series may forward-fill at most MAX_FFILL_DAYS consecutive
     missing days (fill_gaps) and must cover start..end, else
     DataIntegrityError. The raw source series and the USD series are reported
-    to record_api_prices as bitstamp:btcusd, poloniex:ETH_BTC and usd:<asset>.
+    to record_api_prices as bitstamp:btcusd:<range>, poloniex:ETH_BTC:<range>
+    and usd:<asset>:<range>, where <range> is the requested
+    YYYY-MM-DD..YYYY-MM-DD, so loads over different ranges never share a key.
     """
     if asset not in ("BTC", "ETH"):
         raise ValueError(f"asset must be BTC or ETH, got {asset!r}")
+    rng = f"{start.isoformat()}..{end.isoformat()}"
     raw_btc = bitstamp_btcusd(start, end, cache_dir)
-    note_api_price("bitstamp:btcusd", raw_btc)
+    note_api_price(f"bitstamp:btcusd:{rng}", raw_btc)
     btc = _covering(raw_btc, "bitstamp btcusd", start, end)
     if asset == "BTC":
         out = btc
     else:
         raw_eth = poloniex_ethbtc(start, end, cache_dir)
-        note_api_price("poloniex:ETH_BTC", raw_eth)
+        note_api_price(f"poloniex:ETH_BTC:{rng}", raw_eth)
         ethbtc = _covering(raw_eth, "poloniex ETH_BTC", start, end)
         out = ethbtc * btc.reindex(ethbtc.index)
     out = out.rename(f"{asset}USD")
     out.index.name = "date"
-    note_api_price(f"usd:{asset}", out)
+    note_api_price(f"usd:{asset}:{rng}", out)
     return out

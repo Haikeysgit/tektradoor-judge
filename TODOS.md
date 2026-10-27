@@ -11,3 +11,6 @@ Final is two steps: `open-final` writes results/{id}.final_opened and the operat
 
 ## TODO-4: Verify the OpenTimestamps proof (Task 9)
 The judge does not check `prereg/NN-name.json.ots`. Task 9: require it committed and verify it (`ots verify`), and check that the attested block time agrees with `NN-name.stamp_confirmed`. Until then the stamp date and all git dates are local claims (README "Limits").
+
+## TODO-5: repro results 01/02 Bitstamp hash range
+repro results 01/02 recorded bitstamp:btcusd hash for 2015-08-08.. only (key collision, fixed in the commit that adds this TODO: `git log -1 -- TODOS.md`); full BTC series hash is under usd:BTC.

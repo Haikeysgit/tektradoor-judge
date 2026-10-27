@@ -151,8 +151,36 @@ def test_eth_is_ethbtc_times_btcusd_same_day(tmp_path):
     assert list(eth) == pytest.approx([2.0, 4.2, 6.6, 9.2, 12.0])
     assert eth.index.equals(days)
     assert list(btc_usd) == list(btc)
-    assert set(rec) == {"bitstamp:btcusd", "poloniex:ETH_BTC", "usd:ETH", "usd:BTC"}
-    assert rec["usd:ETH"] == data.price_series_sha256(eth)
+    rng = "2015-08-08..2015-08-12"
+    assert set(rec) == {f"bitstamp:btcusd:{rng}", f"poloniex:ETH_BTC:{rng}", f"usd:ETH:{rng}", f"usd:BTC:{rng}"}
+    assert rec[f"usd:ETH:{rng}"] == data.price_series_sha256(eth)
+
+
+def test_api_price_keys_unique_per_date_range(tmp_path):
+    # Ruling 2: the ETH load (from 2015-08-08) must not overwrite the BTC
+    # load's (from 2015-01-01) Bitstamp series hash.
+    days = pd.date_range("2015-01-01", "2015-01-10", freq="D")
+    btc = pd.Series(np.arange(1.0, 11.0), index=days)
+    ethbtc = pd.Series(0.01, index=days)
+    cut = lambda s, a, b: s.loc[pd.Timestamp(a): pd.Timestamp(b)]  # noqa: E731
+    with mock.patch.object(data, "bitstamp_btcusd", lambda a, b, c: cut(btc, a, b)), \
+            mock.patch.object(data, "poloniex_ethbtc", lambda a, b, c: cut(ethbtc, a, b)):
+        with data.record_api_prices() as rec:
+            data.exchange_daily("BTC", date(2015, 1, 1), date(2015, 1, 10), tmp_path)
+            data.exchange_daily("ETH", date(2015, 1, 5), date(2015, 1, 10), tmp_path)
+    full, late = "bitstamp:btcusd:2015-01-01..2015-01-10", "bitstamp:btcusd:2015-01-05..2015-01-10"
+    assert rec[full] == data.price_series_sha256(btc)
+    assert rec[late] == data.price_series_sha256(btc.loc["2015-01-05":])
+    assert rec[full] != rec[late]
+
+
+def test_note_api_price_refuses_conflicting_hash_for_same_key():
+    s = pd.Series([1.0], index=pd.to_datetime(["2015-01-01"]))
+    with data.record_api_prices():
+        data.note_api_price("k", s)
+        data.note_api_price("k", s)  # same series again: fine
+        with pytest.raises(data.DataIntegrityError, match="k"):
+            data.note_api_price("k", s * 2)
 
 
 def test_exchange_daily_refuses_short_coverage(tmp_path):
@@ -242,7 +270,7 @@ def _price_loader(calls, drift=0.0005, seed=1):
         days = pd.date_range(pd.Timestamp(start), pd.Timestamp(end), freq="D")
         rng = np.random.default_rng(seed + (asset == "ETH"))
         s = pd.Series(100 * np.cumprod(1 + drift + 0.03 * rng.standard_normal(len(days))), index=days)
-        data.note_api_price(f"usd:{asset}", s)
+        data.note_api_price(f"usd:{asset}:{start}..{end}", s)
         return s
     return loader
 
@@ -305,7 +333,8 @@ def test_repro_result_written_on_fail_and_never_overwritten(repo):
     assert saved["candidate_id"] == "01-demo-long"
     assert saved["strategy_sha256"] == J.strategy_sha256(J.load_prereg_params(p))
     m = saved["manifest"]
-    assert m["api_price_sha256"]["usd:BTC"] and m["api_price_sha256"]["usd:ETH"]
+    assert m["api_price_sha256"]["usd:BTC:2015-01-01..2025-03-19"]
+    assert m["api_price_sha256"]["usd:ETH:2015-08-08..2025-03-19"]
     assert m["draft_file"] == "prereg/drafts/01-demo-long.json"
     assert m["draft_sha256"] == hashlib.sha256(p.read_bytes()).hexdigest()
     assert m["judge_tree_hash"] == _git(repo, "rev-parse", "HEAD:judge")
@@ -363,10 +392,11 @@ def test_cli_reproduce(repo, monkeypatch, capsys):
 
 # ---------------------------------------------------------------- Test-time gate
 
-def _commit_repro(repo: Path, p: Path, passed=True, strategy=None, kind="repro", commit=True) -> Path:
+def _commit_repro(repo: Path, p: Path, passed=True, strategy=None, kind="repro", commit=True, tree=None) -> Path:
     params = J.load_prereg(p)
     rec = {"candidate_id": params["candidate_id"], "kind": kind, "passed": passed,
-           "strategy_sha256": strategy or J.strategy_sha256(params)}
+           "strategy_sha256": strategy or J.strategy_sha256(params),
+           "manifest": {"judge_tree_hash": tree or _git(repo, "rev-parse", "HEAD:judge")}}
     out = repo / "results" / f"{params['candidate_id']}-repro.json"
     _write_bytes(out, json.dumps(rec) + "\n")
     if commit:
@@ -431,3 +461,65 @@ def test_repro_gate_applies_to_final_alone(repo, monkeypatch):
     with pytest.raises(J.ReproGateError):
         J.run(p, "final_alone")
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
+
+
+# ---------------------------------------------------------------- gate: strategy and cost code (ruling 3)
+
+def _judge_code(repo: Path, costs: str = "# costs v1\n", donchian: str = "# combo v1\n", init: str = None) -> str:
+    """Write judge/costs.py and judge/strategies/*, commit, return HEAD:judge."""
+    _write_bytes(repo / "judge" / "costs.py", costs)
+    _write_bytes(repo / "judge" / "strategies" / "__init__.py", "")
+    _write_bytes(repo / "judge" / "strategies" / "donchian.py", donchian)
+    if init is not None:
+        _write_bytes(repo / "judge" / "__init__.py", init)
+    _commit(repo, "judge code")
+    return _git(repo, "rev-parse", "HEAD:judge")
+
+
+def test_repro_gate_passes_when_only_other_judge_code_changed(repo, monkeypatch):
+    repro_tree = _judge_code(repo)
+    _judge_code(repo, init="# judge.py-level change only\n")  # not strategies/ or costs.py
+    p = _register(repo)
+    _commit_repro(repo, p, tree=repro_tree)
+    assert J.check_repro_pass(repo, repo / "results", J.load_prereg(p))["path"] == f"results/{NAME}-repro.json"
+    monkeypatch.setattr(J, "_load_data", _fake_loader(drift=0.003, calls=[]))
+    assert J.run(p, "test").exists()
+
+
+@pytest.mark.parametrize("change", [
+    {"costs": "# costs v2\n"},
+    {"donchian": "# combo v2\n"},
+])
+def test_repro_gate_refuses_changed_strategy_or_cost_code(repo, monkeypatch, change):
+    repro_tree = _judge_code(repo)
+    _judge_code(repo, **change)
+    p = _register(repo)
+    _commit_repro(repo, p, tree=repro_tree)
+    monkeypatch.setattr(J, "_load_data", lambda *a: pytest.fail("data must not load"))
+    with pytest.raises(J.ReproGateError, match="strategy or cost code changed since reproduction; rerun reproduce"):
+        J.run(p, "test")
+
+
+def test_repro_gate_refuses_added_or_removed_strategy_file(repo):
+    repro_tree = _judge_code(repo)
+    _write_bytes(repo / "judge" / "strategies" / "extra.py", "# new\n")
+    _commit(repo, "add strategy file")
+    p = _register(repo)
+    _commit_repro(repo, p, tree=repro_tree)
+    with pytest.raises(J.ReproGateError, match="strategies/extra.py"):
+        J.check_repro_pass(repo, repo / "results", J.load_prereg(p))
+
+
+def test_repro_gate_refuses_missing_or_unknown_tree(repo):
+    _judge_code(repo)
+    p = _register(repo)
+    _commit_repro(repo, p, tree="e" * 40)
+    with pytest.raises(J.ReproGateError, match="judge_tree_hash"):
+        J.check_repro_pass(repo, repo / "results", J.load_prereg(p))
+    params = J.load_prereg(p)
+    out = repo / "results" / f"{NAME}-repro.json"
+    _write_bytes(out, json.dumps({"candidate_id": NAME, "kind": "repro", "passed": True,
+                                  "strategy_sha256": J.strategy_sha256(params)}) + "\n")
+    _commit(repo, "repro without manifest")
+    with pytest.raises(J.ReproGateError, match="judge_tree_hash"):
+        J.check_repro_pass(repo, repo / "results", params)
