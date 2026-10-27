@@ -1,0 +1,154 @@
+{
+  "candidate_id": "02-zarattini-long-short",
+  "kind": "repro",
+  "passed": true,
+  "checks": {
+    "btc_long_only_net": {
+      "target": 1.56,
+      "ours": 1.6114813395747707,
+      "rel_error": 0.03300085870177605,
+      "passed": true,
+      "asset": "BTC",
+      "long_short": false,
+      "gross_of_costs": false,
+      "cost_per_side": 0.001,
+      "rebalance_threshold": 0.2,
+      "period": {
+        "start": "2015-01-01",
+        "end": "2025-03-19"
+      },
+      "paper_table": "Table 3",
+      "scored_days": 3730,
+      "total_return": 12.519124278308297,
+      "max_dd": 0.19309311101047089
+    },
+    "eth_long_only_net": {
+      "target": 1.51,
+      "ours": 1.5894377645126303,
+      "rel_error": 0.052607791067967084,
+      "passed": true,
+      "asset": "ETH",
+      "long_short": false,
+      "gross_of_costs": false,
+      "cost_per_side": 0.001,
+      "rebalance_threshold": 0.2,
+      "period": {
+        "start": "2015-08-08",
+        "end": "2025-03-19"
+      },
+      "paper_table": "Table 3",
+      "scored_days": 3511,
+      "total_return": 7.70658312289282,
+      "max_dd": 0.14370690232056083
+    },
+    "btc_long_short_gross": {
+      "target": 1.31,
+      "ours": 1.395674801314268,
+      "rel_error": 0.0654006116902808,
+      "passed": true,
+      "asset": "BTC",
+      "long_short": true,
+      "gross_of_costs": true,
+      "cost_per_side": 0.0,
+      "rebalance_threshold": 0.2,
+      "period": {
+        "start": "2015-01-01",
+        "end": "2025-03-19"
+      },
+      "paper_table": "Table 5 Combo",
+      "scored_days": 3730,
+      "total_return": 10.289812628227013,
+      "max_dd": 0.20503233988322855
+    }
+  },
+  "rel_error_limit": 0.2,
+  "worst_rel_error": 0.0654006116902808,
+  "period_notes": {
+    "BTC": "2015-01-01..2025-03-19, as the paper",
+    "ETH": "starts 2015-08-08 (Poloniex listing), paper 2015-08-01"
+  },
+  "strategy_sha256": "6d32584d0d1598aa4bdf3d23bd160b548368e53ff881ce4422795c99c3758e1d",
+  "strategy": {
+    "long_short": true,
+    "lookbacks": [
+      5,
+      10,
+      20,
+      30,
+      60,
+      90,
+      150,
+      250,
+      360
+    ],
+    "vol_target": 0.25,
+    "vol_window": 90,
+    "per_coin_cap_repro": 2.0,
+    "paper_sample_end": "2025-03-19"
+  },
+  "settings": {
+    "cost_per_side": 0.001,
+    "rebalance_threshold": 0.2,
+    "gross_cap": 2.0,
+    "per_coin_cap": 2.0,
+    "funding": "none (spot)",
+    "gross_checks_cost_per_side": 0.0
+  },
+  "sources": {
+    "BTC": "Bitstamp btcusd daily close, candle opening 00:00 UTC (https://www.bitstamp.net/api/v2/ohlc/btcusd/)",
+    "ETH": "Poloniex ETH_BTC DAY_1 close (https://api.poloniex.com/markets/ETH_BTC/candles) x Bitstamp btcusd close, same UTC day"
+  },
+  "manifest": {
+    "draft_file": "prereg/drafts/02-zarattini-long-short.json",
+    "draft_sha256": "609d84cff005fff9b31875b61540efde0c054868f3c3193673bf610011c994ca",
+    "judge_tree_hash": "7682ca7124d78db4feb0c95705e4758feda2ba4f",
+    "git_head": "b1e2e0b4d9f887ad0cdd0c814b88e271402ffdb9",
+    "run_utc": "2026-10-27T17:13:21Z",
+    "api_price_sha256": {
+      "bitstamp:btcusd:2015-01-01..2025-03-19": "3f77d64a9f9e7b9fff847bf84b9f9f1d89c797b93c716aac35f29c00d2553964",
+      "bitstamp:btcusd:2015-08-08..2025-03-19": "2d3e4d1009f1c7011a1ee04bb5faddd2b581c147d618f2676847160ab06be268",
+      "poloniex:ETH_BTC:2015-08-08..2025-03-19": "46a8bfc884e57f0dbf7a7ea3403493efec5bc8329679c288e9ff25cdc5bfa909",
+      "usd:BTC:2015-01-01..2025-03-19": "3f77d64a9f9e7b9fff847bf84b9f9f1d89c797b93c716aac35f29c00d2553964",
+      "usd:ETH:2015-08-08..2025-03-19": "903211693dff2f01df1e5859564b4fa7915e33b044aa7189ca09de63d986dd5a"
+    },
+    "price_data": {
+      "bitstamp:btcusd:2015-01-01..2025-03-19": "results/repro-data/bitstamp-btcusd-2015-01-01..2025-03-19.csv",
+      "bitstamp:btcusd:2015-08-08..2025-03-19": "results/repro-data/bitstamp-btcusd-2015-08-08..2025-03-19.csv",
+      "poloniex:ETH_BTC:2015-08-08..2025-03-19": "results/repro-data/poloniex-ETH_BTC-2015-08-08..2025-03-19.csv",
+      "usd:BTC:2015-01-01..2025-03-19": "results/repro-data/BTC-2015-01-01..2025-03-19.csv",
+      "usd:ETH:2015-08-08..2025-03-19": "results/repro-data/ETH-2015-08-08..2025-03-19.csv"
+    },
+    "python": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+    "pip_freeze": [
+      "appdirs==1.4.4",
+      "build==1.6.1",
+      "certifi==2026.10.19",
+      "charset-normalizer==3.5.2",
+      "click==8.5.0",
+      "colorama==0.4.6",
+      "gitdb==4.0.12",
+      "GitPython==3.2.1",
+      "idna==3.20",
+      "iniconfig==2.3.1",
+      "numpy==2.4.6",
+      "opentimestamps==0.4.5",
+      "opentimestamps-client==0.7.2",
+      "packaging==26.3",
+      "pandas==3.0.6",
+      "pip-tools==7.6.2",
+      "pluggy==1.7.0",
+      "pycryptodomex==3.24.1",
+      "Pygments==2.21.0",
+      "pyproject_hooks==1.3.3",
+      "PySocks==1.7.1",
+      "pytest==9.1.1",
+      "python-bitcoinlib==0.12.2",
+      "python-dateutil==2.9.0.post0",
+      "requests==2.34.2",
+      "six==1.17.0",
+      "smmap==5.0.3",
+      "tzdata==2026.5",
+      "urllib3==2.8.0"
+    ]
+  }
+}
