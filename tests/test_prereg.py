@@ -34,11 +34,11 @@ TODAY = date(2027, 3, 1)  # Final data for FINAL_WIN exists
 TEST_RUN_UTC = "2026-10-27T10:00:00Z"  # after the stamp: allowed
 
 
-def _git(repo: Path, *args: str) -> str:
+def _git(repo: Path, *args: str, when: str = COMMIT_DATE) -> str:
     res = subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args],
         cwd=repo, capture_output=True, text=True, check=True,
-        env={**os.environ, "GIT_AUTHOR_DATE": COMMIT_DATE, "GIT_COMMITTER_DATE": COMMIT_DATE},
+        env={**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
     )
     return res.stdout.strip()
 
@@ -70,9 +70,9 @@ def _write_bytes(path: Path, text) -> None:
     path.write_bytes(text if isinstance(text, bytes) else text.encode())
 
 
-def _commit(repo: Path, msg: str) -> None:
+def _commit(repo: Path, msg: str, when: str = COMMIT_DATE) -> None:
     _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", msg)
+    _git(repo, "commit", "-q", "-m", msg, when=when)
 
 
 def _register(repo: Path, name: str = NAME, **over) -> Path:
@@ -259,6 +259,26 @@ def test_untracked_prereg_refused_even_if_tree_clean_elsewhere(repo):
         check_integrity(p)
 
 
+def test_prereg_rewritten_with_new_sha_in_later_commit_refused(repo):
+    # Review R2: edit the rules, regenerate .sha256, commit. Hashes agree, but
+    # a registered prereg is written exactly once.
+    p = _register(repo)
+    p.write_bytes(p.read_bytes().replace(b'"seed": 7', b'"seed": 99'))
+    _write_bytes(p.with_suffix(".sha256"), f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n")
+    _commit(repo, "rewrite rules")
+    with pytest.raises(PreregMismatch, match="exactly one commit"):
+        check_integrity(p)
+
+
+def test_sha256_companion_rewritten_alone_refused(repo):
+    p = _register(repo)
+    sha = p.with_suffix(".sha256")
+    _write_bytes(sha, sha.read_text().replace("  ", " *"))  # same hash, new commit
+    _commit(repo, "touch sha")
+    with pytest.raises(PreregMismatch, match="exactly one commit"):
+        check_integrity(p)
+
+
 def test_crlf_working_copy_differs_from_committed_blob_refused(repo):
     # Review I7: with eol=lf, a CRLF working file commits as LF and git status
     # stays clean, but the bytes hashed and the bytes in git differ.
@@ -316,22 +336,33 @@ def test_uncommitted_stamp_file_refused(repo):
         check_integrity(p)
 
 
-# ---------------------------------------------------------------- final gate
+# ---------------------------------------------------------------- final gate, step 1: open-final
+
+def _open(repo: Path, p: Path, commit: bool = True) -> Path:
+    marker = J.prepare_final(p)
+    if commit:
+        _commit(repo, "open final")
+    return marker
+
 
 def test_second_final_open_refused(repo):
     p = _register(repo)
     _stamp(repo, p)
     _commit_test_result(repo, p)
-    assert open_final(NAME, **_gate_kw(repo, p)) == "opened"
-    marker = repo / "results" / f"{NAME}.final_opened"
+    marker = open_final(NAME, **_gate_kw(repo, p))
+    assert marker == repo / "results" / f"{NAME}.final_opened"
     rec = json.loads(marker.read_text())
     assert rec["window"] == FINAL_WIN_JSON
     assert rec["prereg_sha256"] == hashlib.sha256(p.read_bytes()).hexdigest()
-    # A different window (or prereg or judge) is a second opening: refused.
+    assert rec["judge_tree_hash"] == _git(repo, "rev-parse", "HEAD:judge")
+    # Uncommitted and matching: idempotent. A different window: refused.
+    assert open_final(NAME, **_gate_kw(repo, p)) == marker
     with pytest.raises(FinalGateError, match="does not match"):
         open_final(NAME, **_gate_kw(repo, p, window=(date(2026, 10, 27), date(2027, 1, 24))))
-    # Same marker, no result: resume.
-    assert open_final(NAME, **_gate_kw(repo, p)) == "resumed"
+    # Once committed, Final is open: opening again is refused.
+    _commit(repo, "open final")
+    with pytest.raises(FinalGateError, match="already"):
+        open_final(NAME, **_gate_kw(repo, p))
 
 
 def test_final_marker_or_result_ever_committed_refused(repo):
@@ -339,12 +370,13 @@ def test_final_marker_or_result_ever_committed_refused(repo):
     p = _register(repo)
     _stamp(repo, p)
     _commit_test_result(repo, p)
-    open_final(NAME, **_gate_kw(repo, p))
-    _commit(repo, "marker")
-    (repo / "results" / f"{NAME}.final_opened").unlink()
+    marker = _open(repo, p)
+    marker.unlink()
     _commit(repo, "delete marker")
     with pytest.raises(FinalGateError, match="history"):
         open_final(NAME, **_gate_kw(repo, p))
+    with pytest.raises(FinalGateError):
+        run(p, "final")
 
 
 def test_final_gate_refuses_uncommitted_results(repo):
@@ -372,7 +404,7 @@ def test_final_gate_needs_matching_committed_test_pass(repo):
         open_final(NAME, **_gate_kw(repo, p))
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
     _commit_test_result(repo, p)
-    assert open_final(NAME, **_gate_kw(repo, p)) == "opened"
+    assert open_final(NAME, **_gate_kw(repo, p)).exists()
 
 
 def test_final_gate_refuses_tracked_but_edited_test_result(repo):
@@ -384,37 +416,85 @@ def test_final_gate_refuses_tracked_but_edited_test_result(repo):
         open_final(NAME, **_gate_kw(repo, p))
 
 
-def test_final_alone_needs_no_test_result(repo, tmp_path):
+def test_final_alone_needs_no_test_result(repo):
     p = _register(repo)
-    assert open_final(NAME, final_alone=True, **_gate_kw(repo, p)) == "opened"
+    assert open_final(NAME, final_alone=True, **_gate_kw(repo, p)).exists()
 
 
-def test_final_opened_written_before_data_load(repo, monkeypatch):
+def test_prepare_final_loads_no_data(repo, monkeypatch):
+    monkeypatch.setattr(J, "_load_data", lambda *a: pytest.fail("open-final must not load data"))
     p = _register(repo)
     _stamp(repo, p)
     _commit_test_result(repo, p)
+    marker = J.prepare_final(p)
+    assert json.loads(marker.read_text())["window"] == FINAL_WIN_JSON
+    assert not (repo / "results" / f"{NAME}-final.json").exists()
+
+
+# ---------------------------------------------------------------- final gate, step 2: run needs a committed marker
+
+def test_run_final_needs_committed_single_commit_marker(repo, monkeypatch):
+    p = _register(repo)
+    _stamp(repo, p)
+    _commit_test_result(repo, p)
+    monkeypatch.setattr(J, "_load_data", lambda *a: pytest.fail("data must not load"))
+    with pytest.raises(FinalGateError, match="open-final"):
+        run(p, "final")  # no marker
+    marker = _open(repo, p, commit=False)
+    with pytest.raises(FinalGateError, match="not committed"):
+        run(p, "final")  # marker not committed
+    _commit(repo, "open final")
+    # A marker touched by a second commit is refused, even if it still matches.
+    rec = json.loads(marker.read_text())
+    rec["note"] = "edited"
+    _write_bytes(marker, json.dumps(rec) + "\n")
+    _commit(repo, "edit marker")
+    with pytest.raises(FinalGateError, match="exactly one commit"):
+        run(p, "final")
+
+
+def test_run_final_refuses_committed_marker_that_does_not_match(repo, monkeypatch):
+    p = _register(repo)
+    _stamp(repo, p)
+    _commit_test_result(repo, p)
+    marker = repo / "results" / f"{NAME}.final_opened"
+    _write_bytes(marker, json.dumps({
+        "prereg_sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+        "judge_tree_hash": _git(repo, "rev-parse", "HEAD:judge"),
+        "window": {"start": "2026-11-01", "end": "2027-01-29"},
+    }) + "\n")
+    _commit(repo, "hand-made marker")
+    monkeypatch.setattr(J, "_load_data", lambda *a: pytest.fail("data must not load"))
+    with pytest.raises(FinalGateError, match="does not match"):
+        run(p, "final")
+
+
+def test_final_loads_data_only_after_marker_committed(repo, monkeypatch):
+    p = _register(repo)
+    _stamp(repo, p)
+    _commit_test_result(repo, p)
+    _open(repo, p)
     seen = {}
 
     class Stop(Exception):
         pass
 
     def loader(market, start, end, cache_dir):
-        seen["opened"] = (repo / "results" / f"{NAME}.final_opened").exists()
         seen["args"] = (market, start, end)
         raise Stop
 
     monkeypatch.setattr(J, "_load_data", loader)
     with pytest.raises(Stop):
         run(p, "final")
-    assert seen["opened"] is True
     assert seen["args"] == ("um", FINAL_WIN[0] - timedelta(days=450), FINAL_WIN[1])
 
 
-def test_final_resumes_after_crash_and_records_stamp_source(repo, monkeypatch):
-    # Review I4: a failure after the marker does not burn Final.
+def test_final_resumes_after_crash_with_committed_marker(repo, monkeypatch):
+    # Review R3: committing the marker (as the README says) never burns Final.
     p = _register(repo)
     _stamp(repo, p)
     _commit_test_result(repo, p)
+    _open(repo, p)
 
     def crash(*a):
         raise data.ArchiveFetchError("https://x", 429)
@@ -429,8 +509,19 @@ def test_final_resumes_after_crash_and_records_stamp_source(repo, monkeypatch):
     assert res["scored_days"] == 90
     m = res["manifest"]
     assert m["stamp_confirmed"] == "2026-10-25" and m["stamp_source"] == "file+flag"
-    assert m["final_gate"] == "resumed"
+    assert m["final_marker"]["path"] == f"results/{NAME}.final_opened"
+    assert len(m["final_marker"]["commit"]) == 40
+    # Final result exists: no second run; once committed, never again.
+    with pytest.raises(J.ResultExists):
+        run(p, "final")
+    _commit(repo, "final result")
+    out.unlink()
+    _commit(repo, "delete final result")
+    with pytest.raises(FinalGateError, match="history"):
+        run(p, "final")
 
+
+# ---------------------------------------------------------------- stamp rules
 
 def test_final_window_must_start_after_test_window(repo, monkeypatch):
     # Amended I2 (a): stamp + 1 day must be after 2026-10-19.
@@ -442,7 +533,7 @@ def test_final_window_must_start_after_test_window(repo, monkeypatch):
         J.check_stamp(p, date(2026, 10, 18))  # Final would start 2026-10-19
     _stamp(repo, p, date(2026, 10, 1))
     with pytest.raises(FinalGateError, match="after the Test window"):
-        run(p, "final")
+        J.prepare_final(p)
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
 
 
@@ -452,11 +543,23 @@ def test_stamp_not_before_prereg_first_commit(repo):
     J.check_stamp(p, date(2026, 10, 20))  # same day: allowed
     with pytest.raises(FinalGateError, match="first commit"):
         J.check_stamp(p, date(2026, 10, 19))  # passes (a), fails (b)
-    # A later commit of the prereg does not move its first-commit date.
-    p.write_bytes(p.read_bytes().replace(b'"seed": 7', b'"seed": 9'))
-    _commit(repo, "later edit")
-    with pytest.raises(FinalGateError, match="2026-10-20"):
-        J.check_stamp(p, date(2026, 10, 19))
+
+
+def test_stamp_file_single_commit_declared_before_final_start(repo):
+    # Review R1: the stamp file is written once, before the Final window starts.
+    p = _register(repo)
+    _stamp(repo, p)
+    J.check_stamp_file(p, FINAL_WIN[0])
+    _write_bytes(p.with_suffix(".stamp_confirmed"), "2026-11-20\n")
+    _commit(repo, "move stamp")
+    with pytest.raises(FinalGateError, match="exactly one commit"):
+        J.check_stamp_file(p, date(2026, 11, 21))
+
+    p2 = _register(repo, name="02-late", candidate_id="02-late")
+    _write_bytes(p2.with_suffix(".stamp_confirmed"), "2026-11-15\n")
+    _commit(repo, "late stamp", when="2027-03-01T12:00:00+00:00")  # written after the window's data existed
+    with pytest.raises(FinalGateError, match="on or before"):
+        J.check_stamp_file(p2, date(2026, 11, 16))
 
 
 def test_final_kind_must_match_candidate_type(repo, monkeypatch):
@@ -535,7 +638,7 @@ def test_run_writes_result_with_manifest(repo, monkeypatch):
     assert m["listed_symbols"] == [f"C{i}USDT" for i in range(5)] + ["DEADUSDT"]
     assert m["market"] == "um"
     assert m["window"] == res["window"]
-    assert m["stamp_source"] is None and m["final_gate"] is None
+    assert m["stamp_source"] is None and m["final_marker"] is None
     assert m["settings"]["cost_per_side"] == 0.0011 and m["settings"]["gross_cap"] == 1.0
     assert "2025-03-31" in m["universe_by_month"] and isinstance(m["excluded"], dict)
     assert m["results_git_status"] == []
@@ -582,6 +685,19 @@ def test_cli_final_without_stamp_is_clear_error(repo, capsys):
     assert cli_main(["run", str(p), "--kind", "final", "--stamp-confirmed", "2026-10-25"]) == 2
     assert "only confirm" in capsys.readouterr().err
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
+
+
+def test_cli_open_final_writes_marker_and_stops(repo, monkeypatch, capsys):
+    monkeypatch.setattr(J, "_load_data", lambda *a: pytest.fail("open-final must not load data"))
+    p = _register(repo)
+    _commit_test_result(repo, p)
+    assert cli_main(["open-final", str(p)]) == 2  # no committed stamp file
+    assert "stamp_confirmed" in capsys.readouterr().err
+    _stamp(repo, p)
+    assert cli_main(["open-final", str(p)]) == 0
+    out = capsys.readouterr().out
+    assert f"{NAME}.final_opened" in out and "commit" in out
+    assert (repo / "results" / f"{NAME}.final_opened").exists()
 
 
 def test_cli_test_run_reports_and_exit_code(repo, monkeypatch, capsys):

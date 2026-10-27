@@ -7,4 +7,7 @@ Build the live, unfakeable public record (requirements R2-1..R2-15 in the spec).
 After any candidate passes Test, check whether a Darwinex Zero track record is a viable independent verification route before going live.
 
 ## TODO-3: Final marker resume
-A Final run that fails after writing results/{id}.final_opened (network error, short data, Ctrl-C) can be rerun only when the marker's prereg sha256, judge tree hash and window all match and no Final result exists; any other marker is refused. The marker stays local until it is committed with the Final result.
+Final is two steps: `open-final` writes results/{id}.final_opened and the operator commits it; `run --kind final` needs that committed, single-commit, matching marker. A Final run that fails (network error, short data, Ctrl-C) is simply rerun: the committed marker allows it while no Final result exists. Once a Final result is in git history, Final never runs again.
+
+## TODO-4: Verify the OpenTimestamps proof (Task 9)
+The judge does not check `prereg/NN-name.json.ots`. Task 9: require it committed and verify it (`ots verify`), and check that the attested block time agrees with `NN-name.stamp_confirmed`. Until then the stamp date and all git dates are local claims (README "Limits").

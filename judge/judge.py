@@ -531,6 +531,19 @@ def _committed_blob(root: Path, path: Path, err=PreregMismatch) -> bytes:
     return blob
 
 
+def _single_commit(root: Path, path: Path, err, why: str) -> tuple[str, date]:
+    """(commit hash, committer date) of the only commit, on any ref, touching ``path``.
+
+    Refuses (``err``) when the file was touched by more than one commit (edited,
+    deleted, re-added) or by none."""
+    rel = Path(path).resolve().relative_to(root).as_posix()
+    lines = [ln for ln in _git(root, "log", "--all", "--format=%H %cs", "--", rel).splitlines() if ln.strip()]
+    if len(lines) != 1:
+        raise err(f"{rel} must have exactly one commit touching it, found {len(lines)}: {why}")
+    commit, day = lines[0].split()
+    return commit, date.fromisoformat(day)
+
+
 def committed_sha256(path: Path) -> str:
     """sha256 of the committed blob of a file (refuses if the working copy differs)."""
     path = Path(path).resolve()
@@ -546,7 +559,10 @@ def check_integrity(prereg_path: Path) -> None:
     3. sha256 of the committed prereg blob equals the .sha256 companion
        (its first token, so ``sha256sum`` output works).
     4. The prereg's judge_tree_hash equals ``git rev-parse HEAD:judge``.
-    5. ``git status`` shows nothing, tracked or untracked, under judge/ or prereg/.
+    5. The prereg and its .sha256 each have exactly one commit touching them
+       (on any ref): a registered prereg is never edited, only replaced by a
+       new candidate number.
+    6. ``git status`` shows nothing, tracked or untracked, under judge/ or prereg/.
     Each failure raises PreregMismatch naming the file (and both hashes).
     """
     path = Path(prereg_path).resolve()
@@ -580,6 +596,8 @@ def check_integrity(prereg_path: Path) -> None:
             f"judge/ code differs from {path.name}: git rev-parse HEAD:judge is {head}, "
             f"judge_tree_hash recorded in {path.name} is {recorded}"
         )
+    for f in (path, sha_file):
+        _single_commit(root, f, PreregMismatch, "a registered prereg is written once; a change needs a new candidate number")
     dirty = _git(root, "status", "--porcelain", "--untracked-files=all", "--", "judge", "prereg")
     if dirty:
         files = ", ".join(line[3:] for line in dirty.splitlines())
@@ -662,7 +680,7 @@ def prereg_first_commit_date(prereg_path: Path) -> date:
     path = Path(prereg_path).resolve()
     root = _repo_root(path.parent)
     rel = path.relative_to(root).as_posix()
-    dates = _git(root, "log", "--diff-filter=A", "--format=%cs", "--", rel).split()
+    dates = _git(root, "log", "--all", "--diff-filter=A", "--format=%cs", "--", rel).split()
     if not dates:
         raise PreregMismatch(f"{rel} has no commit that added it")
     return date.fromisoformat(dates[-1])  # git log lists newest first
@@ -687,6 +705,21 @@ def check_stamp(prereg_path: Path, stamp_confirmed: date) -> None:
         raise FinalGateError(
             f"stamp_confirmed {stamp_confirmed} is before the prereg's first commit ({first}); "
             "a stamp cannot predate the file it stamps"
+        )
+
+
+def check_stamp_file(prereg_path: Path, final_start: date) -> None:
+    """The committed .stamp_confirmed has exactly one commit (on any ref),
+    dated on or before the Final window start, so the window is fixed before
+    its first day and never moved afterwards."""
+    path = Path(prereg_path).resolve()
+    root = _repo_root(path.parent)
+    side = path.with_suffix(".stamp_confirmed")
+    _, committed = _single_commit(root, side, FinalGateError, "stamp_confirmed is written once and never changed")
+    if committed > final_start:
+        raise FinalGateError(
+            f"{side.name} was committed on {committed}, after the Final window start {final_start}: "
+            "the stamp date must be committed on or before the window starts"
         )
 
 
@@ -718,6 +751,35 @@ def _check_test_pass(root: Path, rd: Path, candidate_id: str, prereg_sha256: str
         )
 
 
+def _marker_path(rd: Path, candidate_id: str) -> Path:
+    return rd / f"{candidate_id}.final_opened"
+
+
+def _final_history_guard(root: Path, rd: Path, candidate_id: str) -> None:
+    """Refuse if any Final result for this candidate was ever in git history, or exists."""
+    finals = [rd / f"{candidate_id}-{k}.json" for k in FINAL_KINDS]
+    rels = [f.relative_to(root).as_posix() for f in finals]
+    if _git(root, "log", "--all", "--format=%H", "--", *rels):
+        raise FinalGateError(f"git history already holds a Final result for {candidate_id} ({', '.join(rels)}); Final runs once")
+    if any(f.exists() for f in finals):
+        raise FinalGateError(f"a Final result for {candidate_id} already exists; Final runs once")
+
+
+def _results_clean(root: Path, rd: Path, allow: str | None = None) -> None:
+    dirty = _git(root, "status", "--porcelain", "--untracked-files=all", "--", rd.relative_to(root).as_posix())
+    others = [ln for ln in dirty.splitlines() if ln and ln != allow]
+    if others:
+        raise FinalGateError(f"uncommitted changes under results/: {', '.join(ln[3:] for ln in others)}; commit earlier results first")
+
+
+def _marker_mismatch(marker: Path, expected: dict) -> list[str]:
+    try:
+        rec = json.loads(marker.read_text(encoding="utf-8"))
+    except ValueError:
+        rec = {}
+    return [k for k, v in expected.items() if rec.get(k) != v]
+
+
 def open_final(
     candidate_id: str,
     *,
@@ -726,55 +788,117 @@ def open_final(
     window: Window,
     final_alone: bool = False,
     results_dir: Path | None = None,
-) -> str:
-    """Record that the Final window was opened. Call BEFORE loading Final data.
+) -> Path:
+    """Final step 1: run the gate checks and write results/{id}.final_opened.
 
-    Refuses (FinalGateError) when:
-      * git history (any ref) ever held the Final result or the opened marker;
-      * results/ has uncommitted changes, other than this candidate's own
-        marker when resuming;
+    No data is loaded. The marker holds the prereg sha256, judge tree hash and
+    window; the operator commits it, and only then may ``run`` load Final data
+    (check_final_opened). Refuses (FinalGateError) when:
+      * a Final result was ever in git history, or exists;
+      * the marker was ever committed (Final is already open);
+      * results/ has uncommitted changes (other than this marker);
       * unless Final-alone: there is no committed, unmodified Test result for
         this prereg_sha256 and judge_tree_hash that says passed: true;
-      * a marker exists that does not match (prereg_sha256, judge_tree_hash, window).
-    Writes results/{id}.final_opened holding those three and returns "opened";
-    with a matching marker and no Final result it returns "resumed" (the run
-    is deterministic, so a resume can only finish the same run).
+      * an uncommitted marker exists that does not match.
+    An uncommitted matching marker is left as is (idempotent).
     """
     rd = (Path(results_dir) if results_dir is not None else CODE_ROOT / "results").resolve()
     root = _repo_root(rd.parent)
-    marker = rd / f"{candidate_id}.final_opened"
-    finals = [rd / f"{candidate_id}-{k}.json" for k in FINAL_KINDS]
-    rels = [p.relative_to(root).as_posix() for p in [marker, *finals]]
-    if _git(root, "log", "--all", "--format=%H", "--", *rels):
-        raise FinalGateError(f"git history already holds a Final result or marker for {candidate_id} ({', '.join(rels)}); Final opens once")
-    if any(p.exists() for p in finals):
-        raise FinalGateError(f"a Final result for {candidate_id} already exists; Final opens once")
-    marker_rel = rels[0]
-    dirty = _git(root, "status", "--porcelain", "--untracked-files=all", "--", rd.relative_to(root).as_posix())
-    resuming = marker.exists()
-    others = [ln for ln in dirty.splitlines() if not (resuming and ln == f"?? {marker_rel}")]
-    if others:
-        raise FinalGateError(f"uncommitted changes under results/: {', '.join(ln[3:] for ln in others)}; commit earlier results first")
+    marker = _marker_path(rd, candidate_id)
+    marker_rel = marker.relative_to(root).as_posix()
+    _final_history_guard(root, rd, candidate_id)
+    if _git(root, "log", "--all", "--format=%H", "--", marker_rel):
+        raise FinalGateError(f"git history already holds {marker_rel}: Final was already opened; run --kind final, do not reopen")
+    _results_clean(root, rd, allow=f"?? {marker_rel}" if marker.exists() else None)
     if not final_alone:
         _check_test_pass(root, rd, candidate_id, prereg_sha256, judge_tree_hash)
     expected = {"prereg_sha256": prereg_sha256, "judge_tree_hash": judge_tree_hash, "window": _window_json(window)}
-    if resuming:
-        try:
-            rec = json.loads(marker.read_text(encoding="utf-8"))
-        except ValueError:
-            rec = {}
-        diff = [k for k, v in expected.items() if rec.get(k) != v]
+    if marker.exists():
+        diff = _marker_mismatch(marker, expected)
         if diff:
-            raise FinalGateError(f"{marker.name} does not match this run ({', '.join(diff)}): Final was already opened differently")
-        return "resumed"
+            raise FinalGateError(f"{marker.name} does not match this Final ({', '.join(diff)}); it was opened differently")
+        return marker
     rd.mkdir(parents=True, exist_ok=True)
-    stamp = {"candidate_id": candidate_id, "final_alone": final_alone, "opened_utc": _utc_now(), **expected}
+    rec = {"candidate_id": candidate_id, "final_alone": final_alone, "opened_utc": _utc_now(), **expected}
     try:
         with open(marker, "x", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(stamp) + "\n")
+            fh.write(json.dumps(rec) + "\n")
     except FileExistsError as exc:
         raise FinalGateError(f"Final for {candidate_id} was opened concurrently ({marker.name})") from exc
-    return "opened"
+    return marker
+
+
+def check_final_opened(
+    candidate_id: str,
+    *,
+    prereg_sha256: str,
+    judge_tree_hash: str,
+    window: Window,
+    final_alone: bool = False,
+    results_dir: Path | None = None,
+) -> dict:
+    """Final step 2 gate, checked by ``run`` before any Final data loads.
+
+    The marker must be committed (tracked, working bytes equal to HEAD), touched
+    by exactly one commit, and match (prereg_sha256, judge_tree_hash, window).
+    No Final result may exist or ever have been in history, results/ must be
+    clean, and (unless Final-alone) the committed Test pass must still match.
+    A rerun after a failure passes these checks again: that is the resume.
+    Returns {"path", "commit"} of the marker for the manifest.
+    """
+    rd = (Path(results_dir) if results_dir is not None else CODE_ROOT / "results").resolve()
+    root = _repo_root(rd.parent)
+    marker = _marker_path(rd, candidate_id)
+    marker_rel = marker.relative_to(root).as_posix()
+    _final_history_guard(root, rd, candidate_id)
+    if not marker.exists():
+        raise FinalGateError(
+            f"{marker_rel} is missing: run `python -m judge open-final <prereg>`, commit the marker, then run Final"
+        )
+    _committed_blob(root, marker, FinalGateError)
+    commit, _ = _single_commit(root, marker, FinalGateError, "the Final marker is written once by open-final")
+    _results_clean(root, rd)
+    if not final_alone:
+        _check_test_pass(root, rd, candidate_id, prereg_sha256, judge_tree_hash)
+    expected = {"prereg_sha256": prereg_sha256, "judge_tree_hash": judge_tree_hash, "window": _window_json(window)}
+    diff = _marker_mismatch(marker, expected)
+    if diff:
+        raise FinalGateError(f"committed {marker.name} does not match this Final ({', '.join(diff)})")
+    return {"path": marker_rel, "commit": commit}
+
+
+def _final_context(path: Path, prereg: dict, kind: Kind, stamp_flag: date | None, latest_data_date: date | None = None):
+    """Shared Final preamble: kind vs candidate type, stamp, window, stamp rules."""
+    cid = prereg["candidate_id"]
+    alone = is_final_alone(prereg)
+    if kind == "final" and alone:
+        raise FinalGateError(f"{cid} has a Test window under 12 months: it is Final-alone, run --kind final_alone")
+    if kind == "final_alone" and not alone:
+        raise FinalGateError(f"{cid} has a Test window of 12 months or more: run --kind final after a Test pass, not final_alone")
+    stamp, source = resolve_stamp_confirmed(path, stamp_flag)
+    win = window(kind, prereg, stamp, latest_data_date=latest_data_date)
+    check_stamp(path, stamp)
+    check_stamp_file(path, win[0])
+    return stamp, source, win
+
+
+def prepare_final(prereg_path: Path, *, stamp_confirmed: date | None = None, results_dir: Path | None = None) -> Path:
+    """``python -m judge open-final``: every Final gate check, then write the
+    marker and stop. Loads no data. The kind (final or final_alone) follows
+    from the candidate's Test window. The window's data need not exist yet."""
+    path = Path(prereg_path).resolve()
+    prereg = load_prereg(path)
+    check_integrity(path)
+    root = _repo_root(path.parent)
+    if root != Path(CODE_ROOT).resolve():
+        raise PreregMismatch(f"judge code runs from {Path(CODE_ROOT).resolve()} but {path.name} is in {root}")
+    kind = "final_alone" if is_final_alone(prereg) else "final"
+    _, _, win = _final_context(path, prereg, kind, stamp_confirmed, latest_data_date=date.max)
+    return open_final(
+        prereg["candidate_id"], prereg_sha256=committed_sha256(path), judge_tree_hash=_git(root, "rev-parse", "HEAD:judge"),
+        window=win, final_alone=kind == "final_alone",
+        results_dir=Path(results_dir) if results_dir is not None else root / "results",
+    )
 
 
 # ---------------------------------------------------------------- run
@@ -860,7 +984,8 @@ def run(
     """Judge one candidate on one window and write results/{id}-{kind}.json.
 
     Order: prereg integrity, kind checks, window, manifest inputs that can fail,
-    then (Final only) open_final, and only then the data load. The result file
+    then (Final only) check_final_opened, which needs the marker written by
+    ``open-final`` and committed, and only then the data load. The result file
     is written for passes and failures, and never overwritten. Costs, threshold,
     gross cap, sims and universe size are the judge's JUDGING constants (the
     prereg must state the same values). stamp_confirmed is the
@@ -881,15 +1006,10 @@ def run(
     if out.exists():
         raise ResultExists(f"{out.name} already exists; results are never overwritten")
 
-    alone = is_final_alone(prereg)
-    if kind == "final" and alone:
-        raise FinalGateError(f"{cid} has a Test window under 12 months: it is Final-alone, run --kind final_alone")
-    if kind == "final_alone" and not alone:
-        raise FinalGateError(f"{cid} has a Test window of 12 months or more: run --kind final after a Test pass, not final_alone")
-    stamp, stamp_source = resolve_stamp_confirmed(path, stamp_confirmed) if kind in FINAL_KINDS else (None, None)
-    win = window(kind, prereg, stamp)
     if kind in FINAL_KINDS:
-        check_stamp(path, stamp)
+        stamp, stamp_source, win = _final_context(path, prereg, kind, stamp_confirmed)
+    else:
+        stamp, stamp_source, win = None, None, window(kind, prereg, None)
     prereg_sha = committed_sha256(path)
     tree_hash = _git(root, "rev-parse", "HEAD:judge")
     git_head = _git(root, "rev-parse", "HEAD")
@@ -897,10 +1017,10 @@ def run(
     run_utc = _utc_now()
     results_status = [ln for ln in _git(root, "status", "--porcelain", "--untracked-files=all", "--", "results").splitlines() if ln]
 
-    gate = None
+    final_marker = None
     if kind in FINAL_KINDS:
-        gate = open_final(cid, prereg_sha256=prereg_sha, judge_tree_hash=tree_hash, window=win,
-                          final_alone=kind == "final_alone", results_dir=results_dir)
+        final_marker = check_final_opened(cid, prereg_sha256=prereg_sha, judge_tree_hash=tree_hash, window=win,
+                                          final_alone=kind == "final_alone", results_dir=results_dir)
 
     load_start = win[0] - timedelta(days=LOOKBACK_DAYS)
     with data.record_fetches() as fetched, data.record_api_funding() as api_funding:
@@ -967,7 +1087,7 @@ def run(
             "window": win_json,
             "stamp_confirmed": stamp.isoformat() if stamp else None,
             "stamp_source": stamp_source,
-            "final_gate": gate,
+            "final_marker": final_marker,
             "results_git_status": results_status,
             "market": MARKET,
             "data_loaded": {"start": load_start.isoformat(), "end": win[1].isoformat()},
