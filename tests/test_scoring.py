@@ -206,3 +206,149 @@ def test_luck_odds_in_unit_interval():
     # flip_prob 0: never leaves state 0, so flat; Sharpe 0 never passes.
     assert luck_odds(close, funding, uni, long_short=False, flip_prob=0.0, n_sims=10, seed=1,
                      kind="test", cost_per_side=C, gross_cap=1.0) == 0.0
+
+
+# ---------------------------------------------------------------- luck odds fairness (Task 7 ruling 2)
+
+from datetime import date  # noqa: E402
+
+from judge.judge import luck_sims  # noqa: E402
+
+
+def _sims(**over):
+    close, funding, uni = _luck_inputs()
+    kw = dict(long_short=True, flip_prob=0.05, n_sims=6, seed=3, cost_per_side=C, gross_cap=1.0)
+    kw.update(over)
+    return luck_sims(close, funding, uni, **kw)
+
+
+def test_luck_threshold_reduces_sim_turnover_cost():
+    def drag(threshold):
+        gross = _sims(cost_per_side=0.0, rebalance_threshold=threshold, flip_prob=0.01)
+        net = _sims(cost_per_side=C, rebalance_threshold=threshold, flip_prob=0.01)
+        return float(np.mean([(g - n).sum() for g, n in zip(gross, net)]))
+
+    assert drag(None) > 0
+    assert drag(0.2) < 0.9 * drag(None)
+
+
+def test_luck_window_changes_scored_length():
+    full = _sims()
+    assert len(full[0]) == len(DAYS) - 1
+    win = (date(2024, 7, 1), date(2024, 9, 30))
+    sliced = _sims(window=win)
+    assert len(sliced[0]) == (win[1] - win[0]).days + 1
+    assert sliced[0].index[0] == pd.Timestamp("2024-07-01")
+    assert sliced[0].index[-1] == pd.Timestamp("2024-09-30")
+    # Benchmark is scored on the same days.
+    close, funding, uni = _luck_inputs()
+    b = benchmark_returns(close, funding, uni, C, window=win)
+    assert b.index.equals(sliced[0].index)
+    # Book starts flat: the first trades fill at the close before the window's
+    # first day (00:00 UTC on it); no position is held before that.
+    w = _sims(window=win, return_weights=True)[0]
+    assert (w.loc[:"2024-06-29"] == 0).all().all()
+    assert (w.loc["2024-06-30":] != 0).any().any()
+
+
+def test_luck_sims_average_one_path_per_lookback():
+    close, _, uni = _luck_inputs()
+    lbs = (5, 10, 20, 30, 60, 90, 150, 250, 360)
+    states = luck_sims(close, None, uni, long_short=False, flip_prob=0.3, n_sims=1, seed=1, cost_per_side=0.0,
+                       gross_cap=None, lookbacks=lbs, return_states=True)[0]
+    vals = np.unique(np.round(states.to_numpy() * len(lbs), 9))
+    assert set(vals) <= set(range(len(lbs) + 1))
+    assert len(vals) > 2  # a mean of paths, not all-or-nothing
+
+
+def test_luck_sims_use_candidate_caps_and_exclusions():
+    close, _, uni = _luck_inputs()
+    col = close.columns[0]
+    excluded = {pd.Timestamp(d).date(): {col} for d in pd.date_range("2024-05-01", "2024-05-31")}
+    kw = dict(long_short=False, flip_prob=0.2, n_sims=3, seed=5, cost_per_side=0.0, gross_cap=None)
+    a = luck_sims(close, None, uni, excluded=excluded, return_weights=True, **kw)
+    b = luck_sims(close, None, uni, per_coin_cap=0.1, vol_target=0.5, vol_window=30, return_weights=True, **kw)
+    assert (a[0].loc["2024-05-01":"2024-05-31", col] == 0).all()
+    assert (b[0].abs() <= 0.1 / close.shape[1] + 1e-12).all().all()
+
+
+def test_luck_odds_deterministic_with_new_settings():
+    close, funding, uni = _luck_inputs()
+    excluded = {date(2024, 5, 3): {close.columns[0]}}
+    kw = dict(long_short=True, flip_prob=0.05, n_sims=5, seed=9, cost_per_side=C, gross_cap=1.0,
+              rebalance_threshold=0.2, per_coin_cap=1.5, vol_target=0.3, vol_window=30,
+              excluded=excluded, window=(date(2024, 6, 1), date(2024, 12, 31)))
+    a, b = luck_sims(close, funding, uni, **kw), luck_sims(close, funding, uni, **kw)
+    for x, y in zip(a, b):
+        pd.testing.assert_series_equal(x, y)
+    other = luck_sims(close, funding, uni, **{**kw, "seed": 10})
+    assert not all(x.equals(y) for x, y in zip(a, other))
+    odds_kw = {k: v for k, v in kw.items() if k != "n_sims"}
+    p = luck_odds(close, funding, uni, kind="test", n_sims=20, **odds_kw)
+    assert p == luck_odds(close, funding, uni, kind="test", n_sims=20, **odds_kw)
+    bench = benchmark_returns(close, funding, uni, C, excluded=excluded, window=kw["window"])
+    assert luck_odds(close, funding, uni, kind="test", n_sims=20, bench=bench, **odds_kw) == p
+
+
+# ---------------------------------------------------------------- sim paths mirror the candidate (review I6)
+
+from judge.judge import _random_states, flip_prob_for_rate, observed_path_models, sim_path_args  # noqa: E402
+from judge.strategies.donchian import _allocation_frame, signal  # noqa: E402
+
+
+def test_flip_prob_for_rate():
+    assert flip_prob_for_rate(0.04, [0.5, 0.5]) == pytest.approx(0.08)  # uniform: k/(k-1)
+    assert flip_prob_for_rate(0.04, [1 / 3] * 3) == pytest.approx(0.06)
+    assert flip_prob_for_rate(0.03, [0.75, 0.25]) == pytest.approx(0.03 / (1 - 0.625))
+    assert flip_prob_for_rate(0.9, [0.5, 0.5]) == 1.0  # capped
+    assert flip_prob_for_rate(0.0, [1.0, 0.0]) == 0.0  # never leaves its state
+
+
+def _long_market(n_coins=12, n_days=3000, seed=21):
+    days = pd.date_range("2015-01-01", periods=n_days, freq="D")
+    rng = np.random.default_rng(seed)
+    close = pd.DataFrame(100 * np.cumprod(1 + 0.03 * rng.standard_normal((n_days, n_coins)), axis=0),
+                         index=days, columns=[f"C{i:02d}USDT" for i in range(n_coins)])
+    months = pd.date_range(days[0] - pd.Timedelta(days=31), days[-1], freq="ME")
+    uni = {m.date(): list(close.columns) for m in months}
+    excluded = {d.date(): {close.columns[0]} for d in pd.date_range("2018-03-01", "2018-08-31")}
+    win = (days[400].date(), days[-1].date())
+    return close, uni, excluded, win
+
+
+@pytest.mark.parametrize("long_short", [False, True])
+def test_sim_paths_match_candidate_exposure_and_change_rate(long_short):
+    close, uni, excluded, win = _long_market()
+    lbs = (5, 20, 60)
+    models = observed_path_models(close, uni, excluded, lbs, long_short, win)
+
+    # The candidate's own numbers, on active decision days start-1 .. end-1.
+    active = _allocation_frame(close, uni, excluded)[0].to_numpy(dtype=bool)
+    idx = close.index
+    in_win = (idx >= pd.Timestamp(win[0]) - pd.Timedelta(days=1)) & (idx <= pd.Timestamp(win[1]) - pd.Timedelta(days=1))
+    mask = active & np.asarray(in_win)[:, None]
+    assert not mask[:, 0].all()  # the exclusion is in the mask
+
+    states = np.array([-1, 0, 1] if long_short else [0, 1])
+    flips, probs = sim_path_args(models, long_short)
+    rng = np.random.default_rng(0)
+    combo_cand = np.zeros(close.shape)
+    for m, n, f, p in zip(models, lbs, flips, probs):
+        pos = np.column_stack([signal(close[c], n, long_short).to_numpy() for c in close.columns]).astype(float)
+        combo_cand += pos / len(lbs)
+        prev = np.vstack([np.zeros((1, pos.shape[1])), pos[:-1]])
+        cand_rate = (pos != prev)[mask].mean()
+        cand_exposure = pos[mask].mean()
+        assert m["change_rate"] == pytest.approx(cand_rate)
+        assert m["p_long"] - m["p_short"] == pytest.approx(cand_exposure)
+        assert m["p_flat"] == pytest.approx((pos[mask] == 0).mean())
+
+        path = _random_states(rng, close.shape, f, states, p)
+        prev = np.vstack([np.zeros((1, path.shape[1])), path[:-1]])
+        assert (path != prev)[mask].mean() == pytest.approx(cand_rate, rel=0.10)
+        assert path[mask].mean() == pytest.approx(cand_exposure, abs=0.05)
+        assert np.abs(path)[mask].mean() == pytest.approx(np.abs(pos)[mask].mean(), abs=0.05)
+
+    sim_state = luck_sims(close, None, uni, long_short, flips, 1, 3, 0.0, None,
+                          state_probs=probs, lookbacks=lbs, excluded=excluded, return_states=True)[0]
+    assert sim_state.to_numpy()[mask].mean() == pytest.approx(combo_cand[mask].mean(), abs=0.05)

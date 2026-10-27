@@ -417,3 +417,28 @@ def test_panel_still_raises_on_gap_between_files(tmp_path):
     with mock.patch("judge.data.requests.get", fake):
         with pytest.raises(MissingArchiveFile):
             data.panel(["XUSDT"], "um", date(2026, 1, 1), date(2026, 3, 31), tmp_path)
+
+
+def test_api_funding_rows_recorded_and_hashed(tmp_path):
+    d0 = ms("2026-01-01")
+    api = [
+        {"symbol": "BTCUSDT", "fundingTime": d0 + 8 * 3600 * 1000, "fundingRate": "0.0001"},
+        {"symbol": "BTCUSDT", "fundingTime": d0, "fundingRate": "0.00030000"},
+    ]
+
+    def fake_get(u, params=None, timeout=None, **kw):
+        if u in (FUND_URL, FUND_URL + ".CHECKSUM"):
+            return Resp(404)
+        return Resp(200, json_data=api if params["startTime"] <= d0 else [])
+
+    with mock.patch("judge.data.requests.get", fake_get):
+        with data.record_api_funding() as rec:
+            data.daily_funding("BTCUSDT", date(2026, 1, 1), date(2026, 1, 1), tmp_path)
+        data.daily_funding("BTCUSDT", date(2026, 1, 1), date(2026, 1, 1), tmp_path)  # outside: not recorded
+    assert rec == {"BTCUSDT": [(d0 + 8 * 3600 * 1000, 0.0001), (d0, 0.0003)]}
+    # Canonical CSV: header, rows sorted by time, rate as Python float repr, LF.
+    canonical = f"symbol,time,rate\nBTCUSDT,{d0},0.0003\nBTCUSDT,{d0 + 8 * 3600 * 1000},0.0001\n"
+    expected = hashlib.sha256(canonical.encode()).hexdigest()
+    assert data.funding_rows_sha256("BTCUSDT", rec["BTCUSDT"]) == expected
+    # Order and duplicates do not change the hash.
+    assert data.funding_rows_sha256("BTCUSDT", rec["BTCUSDT"][::-1] * 2) == expected
