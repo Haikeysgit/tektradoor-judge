@@ -1,8 +1,8 @@
 # tektradoor-judge
 
-A private, pre-registered test rig for crypto trading strategies. Each candidate strategy is written down (rules, seed, code version) and timestamped before it is run on out-of-sample data, so the result cannot be tuned after the fact, by anyone including the owner. Costs, funding and a same-universe buy-and-hold benchmark are applied the same way to every candidate.
+A pre-registered test rig for crypto trading strategies. Each candidate strategy is written down (rules, seed, code version) and timestamped before it is run on out-of-sample data, so the result cannot be tuned after the fact, by anyone including the owner. Costs, funding and a same-universe buy-and-hold benchmark are applied the same way to every candidate.
 
-The repository is private. The public proof is the sha256 of each prereg file, posted publicly (and stamped with OpenTimestamps) before that candidate's Test run. When a prereg file is shown later, it can be checked against the posted hash and its stamp; the judge itself refuses to run if that file or the judge code changed after registration.
+The repository is public. Before each candidate's Test run, its prereg file is committed here and its sha256 is posted publicly and stamped with OpenTimestamps, so anyone can check the file against the posted hash, the stamp and GitHub's push time. The judge itself refuses to run if that file or the judge code changed after registration.
 
 ## Running a candidate
 
