@@ -1,0 +1,16 @@
+{
+  "_note": "Recorded from blockstream.info on 2026-11-16: GET /api/block-height/840000 and /api/block/{hash}/header. Block 840000 (the 2024 halving block) pins the proof-of-work difficulty floor on a real modern header. reference_block_json holds fields of /api/block/{hash} for cross-checking only.",
+  "base": "https://blockstream.info/api",
+  "responses": {
+    "/block-height/840000": "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+    "/block/0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5/header": "00e05f2aab948491071265ad552351d0ad625745668da54b0172010000000000000000004f89a5d73bd4d4887f25981fe81892ccafda10c27f52d6f3dd28183a7c411b03b7072366194203177d9863ea"
+  },
+  "reference_block_json": {
+    "id": "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+    "height": 840000,
+    "timestamp": 1713571767,
+    "merkle_root": "031b417c3a1828ddf3d6527fc210daafcc9218e81f98257f88d4d43bd7a5894f",
+    "bits": 386089497,
+    "difficulty": 86388558925171.02
+  }
+}

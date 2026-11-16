@@ -3,15 +3,20 @@ import hashlib
 import json
 import os
 import subprocess
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
+from opentimestamps.core.notary import BitcoinBlockHeaderAttestation, PendingAttestation
+from opentimestamps.core.op import OpAppend, OpSHA256
+from opentimestamps.core.serialize import BytesSerializationContext
+from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp
 
 from judge import data
 from judge import judge as J
+from judge import stamp as S
 from judge.__main__ import main as cli_main
 from judge.judge import (
     FinalGateError,
@@ -27,9 +32,9 @@ from judge.judge import (
 
 NAME = "01-demo-long"
 COMMIT_DATE = "2026-10-20T12:00:00+00:00"  # every test commit, so first-commit dates are fixed
-STAMP = date(2026, 10, 25)
-FINAL_WIN = (date(2026, 10, 26), date(2027, 1, 23))
-FINAL_WIN_JSON = {"start": "2026-10-26", "end": "2027-01-23"}
+STAMP = date(2026, 11, 1)  # block at noon UTC, 11 h after POST_TIME; the post precedes the window start
+FINAL_WIN = (date(2026, 11, 2), date(2027, 1, 30))
+FINAL_WIN_JSON = {"start": "2026-11-02", "end": "2027-01-30"}
 TODAY = date(2027, 3, 1)  # Final data for FINAL_WIN exists
 TEST_RUN_UTC = "2026-10-27T10:00:00Z"  # after the stamp: allowed
 
@@ -75,18 +80,123 @@ def _commit(repo: Path, msg: str, when: str = COMMIT_DATE) -> None:
     _git(repo, "commit", "-q", "-m", msg, when=when)
 
 
-def _register(repo: Path, name: str = NAME, **over) -> Path:
-    """Write prereg/NN-name.json (+ .sha256) for the committed judge tree; commit."""
+CALENDAR = "https://alice.btc.calendar.opentimestamps.org"
+
+
+class FakeExplorer:
+    """Offline stand-in for stamp.BlockstreamExplorer: blocks registered by height."""
+
+    base = "fake://explorer"
+
+    def __init__(self):
+        self.blocks: dict[int, dict] = {}
+        self.calls: list[int] = []
+
+    def block_at(self, height: int) -> dict:
+        self.calls.append(height)
+        if height not in self.blocks:
+            raise J.StampError(f"fake explorer has no block {height}")
+        return dict(self.blocks[height])
+
+
+def _block_height(day: date) -> int:
+    return 920_000 + (day - date(2026, 1, 1)).days
+
+
+def _noon(day: date) -> int:
+    return int(pd.Timestamp(day.isoformat() + "T12:00:00Z").timestamp())
+
+
+def ots_bytes(digest: bytes, *, pending=(CALENDAR,), bitcoin=(), explorer: FakeExplorer | None = None,
+              wrong_root: bool = False) -> bytes:
+    """A detached sha256 .ots proof for ``digest``.
+
+    pending: calendar URIs, each behind its own (append, sha256) path.
+    bitcoin: (height, unix time) pairs, each a BitcoinBlockHeaderAttestation
+    on its own path; with ``explorer``, the block is registered there with the
+    merkle root the path commits to (display byte order, as Blockstream
+    serves it), or a different root when ``wrong_root``.
+    """
+    ts = Timestamp(digest)
+    for i, uri in enumerate(pending):
+        leaf = ts.ops.add(OpAppend(b"pending-%d" % i)).ops.add(OpSHA256())
+        leaf.attestations.add(PendingAttestation(uri))
+    for height, when in bitcoin:
+        leaf = ts.ops.add(OpAppend(b"block-%d" % height)).ops.add(OpSHA256())
+        leaf.attestations.add(BitcoinBlockHeaderAttestation(height))
+        if explorer is not None:
+            root = leaf.msg[::-1].hex() if not wrong_root else hashlib.sha256(b"other").hexdigest()
+            explorer.blocks[height] = {"height": height, "hash": f"{height:064x}", "merkle_root": root, "timestamp": when}
+    ctx = BytesSerializationContext()
+    DetachedTimestampFile(OpSHA256(), ts).serialize(ctx)
+    return ctx.getbytes()
+
+
+def _ots_path(p: Path) -> Path:
+    return p.with_name(p.name + ".ots")
+
+
+# The default post time of a test announcement. It is on or after the
+# 2026-11-01 floor, after the 2026-10-20 commits, before the patched "now"
+# (NOW_UTC), within [block - 48 h, block + 7 days] of the STAMP block
+# (2026-11-01 12:00 UTC), and before the Final window start (2026-11-02
+# 00:00 UTC), as the Final rules need.
+POST_TIME = datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)
+NOW_UTC = datetime(2027, 3, 1, 12, 0, tzinfo=timezone.utc)  # the run's start time in tests (TODAY)
+
+
+def status_id(when: datetime, seq: int = 0) -> int:
+    """An X/Twitter snowflake status id created at ``when`` (low bits: seq)."""
+    ms = int(when.timestamp() * 1000)
+    return ((ms - S.SNOWFLAKE_EPOCH_MS) << 22) + seq
+
+
+def status_url(when: datetime = POST_TIME, seq: int = 0, user: str = "tektradoor") -> str:
+    return f"https://x.com/{user}/status/{status_id(when, seq)}"
+
+
+def _announce(repo: Path, cid: str, sha: str, url: str | None = None, commit: bool = True,
+              post: datetime = POST_TIME, when: str = COMMIT_DATE) -> Path:
+    """Add (or overwrite) the announced.json entry for cid; commit."""
+    ann = repo / "prereg" / "announced.json"
+    cur = json.loads(ann.read_text()) if ann.exists() else {}
+    cur[cid] = {"sha256": sha, "url": url if url is not None else status_url(post, seq=len(cur))}
+    _write_bytes(ann, json.dumps(cur, indent=2, sort_keys=True) + "\n")
+    if commit:
+        _commit(repo, f"announce {cid}", when=when)
+    return ann
+
+
+def _register(repo: Path, name: str = NAME, *, stamp_ots: bool = True, announce: bool = True,
+              when: str = COMMIT_DATE, **over) -> Path:
+    """Write prereg/NN-name.json (+ .sha256, + a pending .json.ots) for the
+    committed judge tree; commit. Then (announce) add its announced.json entry
+    in a second commit, as the registration steps say."""
     tree = _git(repo, "rev-parse", "HEAD:judge")
     p = repo / "prereg" / f"{name}.json"
     _write_bytes(p, json.dumps(_prereg_dict(tree, **over), indent=2) + "\n")
     sha = hashlib.sha256(p.read_bytes()).hexdigest()
     _write_bytes(p.with_suffix(".sha256"), f"{sha}  {p.name}\n")
-    _commit(repo, "register")
+    if stamp_ots:
+        _write_bytes(_ots_path(p), ots_bytes(bytes.fromhex(sha)))
+    _commit(repo, "register", when=when)
+    if announce:
+        _announce(repo, p.stem, sha, when=when)
     return p
 
 
-def _stamp(repo: Path, p: Path, day: date = STAMP) -> None:
+def _upgrade_ots(p: Path, *blocks: date) -> None:
+    """Rewrite p's .ots with a pending and one Bitcoin attestation per day
+    (block at noon UTC), registered in the fake explorer. Not committed."""
+    digest = hashlib.sha256(p.read_bytes()).digest()
+    bitcoin = [(_block_height(d), _noon(d)) for d in blocks]
+    _write_bytes(_ots_path(p), ots_bytes(digest, bitcoin=bitcoin, explorer=S.default_explorer()))
+
+
+def _stamp(repo: Path, p: Path, day: date = STAMP, block_day: date | None = None) -> None:
+    """Commit .stamp_confirmed = day, with the .ots upgraded to a Bitcoin
+    attestation in a block dated block_day (default: day)."""
+    _upgrade_ots(p, block_day or day)
     _write_bytes(p.with_suffix(".stamp_confirmed"), f"{day.isoformat()}\n")
     _commit(repo, "stamp confirmed")
 
@@ -172,6 +282,9 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setattr(J, "_pip_freeze", lambda: ["numpy==0.0-test"])
     monkeypatch.setitem(J.JUDGING, "n_sims", 8)  # keep run() tests fast
     monkeypatch.setattr(J, "_today_utc", lambda: TODAY)
+    fake = FakeExplorer()
+    monkeypatch.setattr(S, "default_explorer", lambda: fake)  # never the network in tests
+    monkeypatch.setattr(S, "_now_utc", lambda: NOW_UTC)  # the run's start time
     return root
 
 
@@ -352,8 +465,8 @@ def test_final_needs_stamp_and_full_data():
     # 90 days starting the day after the stamp date.
     assert window("final", pre, STAMP, latest_data_date=TODAY) == FINAL_WIN
     assert window("final_alone", pre, STAMP, latest_data_date=FINAL_WIN[1])[1] == FINAL_WIN[1]
-    with pytest.raises(FinalNotReady, match="2027-01-22"):
-        window("final", pre, STAMP, latest_data_date=date(2027, 1, 22))
+    with pytest.raises(FinalNotReady, match="2027-01-29"):
+        window("final", pre, STAMP, latest_data_date=date(2027, 1, 29))
 
 
 # ---------------------------------------------------------------- stamp_confirmed
@@ -552,7 +665,7 @@ def test_final_resumes_after_crash_with_committed_marker(repo, monkeypatch):
     assert res["kind"] == "final" and res["window"] == FINAL_WIN_JSON
     assert res["scored_days"] == 90
     m = res["manifest"]
-    assert m["stamp_confirmed"] == "2026-10-25" and m["stamp_source"] == "file+flag"
+    assert m["stamp_confirmed"] == STAMP.isoformat() and m["stamp_source"] == "file+flag"
     assert m["final_marker"]["path"] == f"results/{NAME}.final_opened"
     assert len(m["final_marker"]["commit"]) == 40
     # Final result exists: no second run; once committed, never again.

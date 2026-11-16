@@ -4,6 +4,7 @@
     python -m judge open-final prereg/NN-name.json      # Final step 1
     python -m judge run prereg/NN-name.json --kind final|final_alone   # step 2
     python -m judge reproduce prereg/drafts/NN-name.json  # paper reproduction
+    python -m judge ots-status [--fail-pending-hours 48]  # each prereg's .ots state
 
 Final is two steps. ``open-final`` runs every Final gate check, writes
 results/NN-name.final_opened (prereg sha256, judge tree hash, window) and
@@ -13,7 +14,8 @@ before it loads any Final data. A failed Final run can simply be rerun.
 
 Exit codes for run: 0 the run completed and passed, 1 it completed and did not
 pass (the result file is written either way), 2 the judge refused (integrity,
-window, Final gate, existing result), 3 a data error. open-final: 0 marker
+window, Final gate, existing result), 3 a data error, 4 a judge bug (executed
+gross exposure above the gross cap; no result is written). open-final: 0 marker
 written, 2 refused. reproduce: 0 every check passed, 1 completed and failed
 (the result file is written either way), 2 refused, 3 a data error.
 
@@ -24,6 +26,19 @@ stamp_confirmed (needed for Final) comes only from the committed companion
 file prereg/NN-name.stamp_confirmed (one ISO date line, one commit).
 --stamp-confirmed may only confirm it: a flag without the file, or one that
 disagrees with it, is refused.
+
+Every run also needs the prereg's committed .json.ots proof (a pending
+calendar attestation is enough for Test) and its committed, never edited
+entry in prereg/announced.json, whose post time (decoded from the status id)
+lies between registration and the run. Final needs the proof confirmed in a
+Bitcoin block whose UTC date equals stamp_confirmed and whose time is within
+7 days before to 48 h after the post (checked against the block's raw header
+from blockstream.info, proof of work included).
+
+ots-status prints each prereg's proof state (missing, invalid,
+digest-mismatch, pending, bitcoin). Exit 1 if any proof is missing, invalid
+or for other bytes, or (with --fail-pending-hours H) still pending more than
+H hours after the .ots was first committed; else 0.
 """
 from __future__ import annotations
 
@@ -34,7 +49,9 @@ from datetime import date
 from pathlib import Path
 
 from judge import data
+from judge import diagnostics
 from judge import judge as J
+from judge import stamp as S
 from judge.judge import KINDS, JudgeRefusal, prepare_final, reproduce, run
 
 DATA_ERRORS = (data.MissingArchiveFile, data.ChecksumMismatch, data.ArchiveFetchError, data.DataIntegrityError)
@@ -68,7 +85,17 @@ def main(argv: list[str] | None = None) -> int:
     rp = sub.add_parser("reproduce", help="reproduce the paper's single-asset Sharpe ratios for a prereg draft")
     rp.add_argument("prereg", type=Path, help="prereg/drafts/NN-name.json")
     rp.add_argument("--cache-dir", type=Path, default=None, help="API response cache (default: <repo>/data_cache/repro)")
+    st = sub.add_parser("ots-status", help="print each prereg's OpenTimestamps proof state")
+    st.add_argument(
+        "--fail-pending-hours", type=float, default=None, metavar="H",
+        help="exit 1 if a proof is still pending H hours after the .ots was first committed",
+    )
     args = parser.parse_args(argv)
+
+    if args.command == "ots-status":
+        rows = S.ots_status(J.CODE_ROOT, fail_pending_hours=args.fail_pending_hours)
+        print(S.format_status(rows, args.fail_pending_hours))
+        return 1 if any(r["problem"] for r in rows) else 0
 
     if args.command == "reproduce":
         try:
@@ -107,6 +134,9 @@ def main(argv: list[str] | None = None) -> int:
     except JudgeRefusal as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
+    except diagnostics.GrossExposureError as exc:
+        print(f"JUDGE BUG, no result written: {exc}", file=sys.stderr)
+        return 4
     except DATA_ERRORS as exc:
         print(f"data error: {exc}", file=sys.stderr)
         return 3
@@ -117,6 +147,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{res['window']['start']}..{res['window']['end']}: sharpe {v['sharpe']:.3f}, "
         f"max_dd {v['max_dd']:.3f}, bench_sharpe {v['bench_sharpe']:.3f}, luck_odds {res['luck_odds']:.3f}"
     )
+    for line in diagnostics.summary(res["diagnostics"]):
+        print(f"  {line}")
     print(f"wrote {out}")
     return 0 if res["passed"] else 1
 

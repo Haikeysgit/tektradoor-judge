@@ -1,0 +1,48 @@
+name: OpenTimestamps
+# Daily status check of each prereg's .ots proof. It never commits or pushes:
+# the founder is the repo's only author. Upgrades are tried on a scratch copy
+# and reported as a notice; the founder runs `ots upgrade` locally and
+# commits the upgraded proof through a normal PR. The job fails if a proof
+# is still pending 48 h after it was first committed.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0 # ots-status ages each proof by its first commit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --require-hashes -r requirements.txt
+      - name: Try upgrades on a scratch copy (pending is fine)
+        shell: bash
+        run: |
+          shopt -s nullglob
+          scratch="$RUNNER_TEMP/ots-scratch"
+          mkdir -p "$scratch"
+          available=()
+          for f in prereg/*.ots; do
+            copy="$scratch/$(basename "$f")"
+            cp "$f" "$copy"
+            # One file per call: `ots upgrade` exits 1 while a proof is still
+            # pending, and with several files it would stop at the first.
+            if ots upgrade "$copy"; then echo "$f: complete"; else echo "$f: still pending (exit $?)"; fi
+            if ! cmp -s "$f" "$copy"; then available+=("$f"); fi
+          done
+          if [ ${#available[@]} -gt 0 ]; then
+            echo "::notice title=OpenTimestamps upgrade available::${available[*]}: run 'ots upgrade' on these locally and commit the upgraded proofs through a PR"
+          else
+            echo "no upgrade available"
+          fi
+      - name: Proof status (fails if a proof is pending over 48 h)
+        run: python -m judge ots-status --fail-pending-hours 48

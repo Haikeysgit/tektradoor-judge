@@ -9,8 +9,8 @@ After any candidate passes Test, check whether a Darwinex Zero track record is a
 ## TODO-3: Final marker resume
 Final is two steps: `open-final` writes results/{id}.final_opened and the operator commits it; `run --kind final` needs that committed, single-commit, matching marker. A Final run that fails (network error, short data, Ctrl-C) is simply rerun: the committed marker allows it while no Final result exists. Once a Final result is in git history, Final never runs again.
 
-## TODO-4: Verify the OpenTimestamps proof (Task 9)
-The judge does not check `prereg/NN-name.json.ots`. Task 9: require it committed and verify it (`ots verify`), and check that the attested block time agrees with `NN-name.stamp_confirmed`. Until then the stamp date and all git dates are local claims (README "Limits").
+## TODO-4: Verify the OpenTimestamps proof (Task 9) - DONE (Task 9a)
+Done in `judge/stamp.py`: the committed `.json.ots` must stamp the committed prereg's sha256. Test accepts a pending attestation. Final, Final-alone and `open-final` need a Bitcoin attestation whose merkle root matches the block's raw header from blockstream.info (the header must hash to the block hash; no local node, no `ots verify`), and `.stamp_confirmed` must equal that header's UTC date. The daily `ots` workflow only checks and notifies; upgraded proofs are committed locally through a PR. `python -m judge ots-status` reports them. The explorer is the remaining trust point (README "Limits").
 
 ## TODO-5: repro results 01/02 Bitstamp hash range (first run only)
 The first reproduction run's results 01/02 recorded the bitstamp:btcusd hash for 2015-08-08.. only (key collision, fixed in the commit "fix(judge): unique api price keys, tie repro gate to strategy and cost code"; find it with the oldest commit in `git log -S"TODO-5" -- TODOS.md`). The full BTC series hash was under usd:BTC. That run's result commit was dropped from the unpushed branch before merge (review round 1), and its numbers are kept in task-8-report.md. The rerun's results use range keys, so this entry is history only.

@@ -27,6 +27,8 @@ import numpy as np
 import pandas as pd
 
 from judge import data
+from judge import diagnostics
+from judge import stamp as stamps
 from judge.costs import net_returns
 from judge.metrics import DAYS_PER_YEAR, max_drawdown, sharpe, total_return
 from judge.prices import exchange_daily  # noqa: F401  (the default reproduction loader)
@@ -58,6 +60,8 @@ from judge.strategies.donchian import (
     VOL_WINDOW,
     _allocation_frame,
     _apply_allocation,
+    _excluded_mask,
+    _universe_mask,
     allocate,
     portfolio_weights,
     signal,
@@ -422,6 +426,14 @@ class ReproGateError(JudgeRefusal):
     """Test (or Final-alone) needs a committed, passing reproduction of the same strategy."""
 
 
+class StampError(JudgeRefusal):
+    """The prereg's .ots proof is missing, uncommitted, for other bytes, or not (yet) good enough."""
+
+
+class AnnouncementError(JudgeRefusal):
+    """Test (or Final-alone) needs the prereg's sha256 publicly announced in prereg/announced.json."""
+
+
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
@@ -722,6 +734,35 @@ def check_stamp_file(prereg_path: Path, final_start: date) -> None:
         )
 
 
+def check_final_proof(prereg_path: Path, stamp_confirmed: date, post_time: datetime, explorer=None) -> dict:
+    """Final's stamp proof: the .ots has a Bitcoin attestation that matches its
+    block at the explorer (stamp.check_ots, require_bitcoin=True); the
+    committed stamp_confirmed equals the UTC date of the earliest attested
+    block's header time; and that block lies within [post_time - 7 days,
+    post_time + 48 h] of the announcement post (stamp.check_stamp_near_post),
+    so a proof stamped again later cannot move the Final window; and the post
+    is strictly before the Final window start (stamp_confirmed + 1 day, 00:00
+    UTC), so no Final day is seen before the hash is public. Returns the ots
+    info for the manifest."""
+    info = stamps.check_ots(prereg_path, require_bitcoin=True, explorer=explorer)
+    block_day = date.fromisoformat(info["block_time_utc"][:10])
+    if stamp_confirmed != block_day:
+        side = Path(prereg_path).with_suffix(".stamp_confirmed").name
+        raise StampError(
+            f"{side} says {stamp_confirmed}, but the earliest Bitcoin attestation is block "
+            f"{info['block_height']} at {info['block_time_utc']} (UTC date {block_day}); they must be equal"
+        )
+    stamps.check_stamp_near_post(info, post_time)
+    final_start = datetime.combine(stamp_confirmed + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    if post_time >= final_start:
+        raise StampError(
+            f"the announcement post ({stamps.utc_ms_iso(post_time)}) is not before the Final window start "
+            f"({final_start.strftime('%Y-%m-%dT%H:%M:%SZ')}, stamp_confirmed {stamp_confirmed} + 1 day): "
+            "the hash must be public before any Final day"
+        )
+    return info
+
+
 def _window_json(win: Window) -> dict:
     return {"start": win[0].isoformat(), "end": win[1].isoformat()}
 
@@ -881,11 +922,18 @@ def _final_context(path: Path, prereg: dict, kind: Kind, stamp_flag: date | None
     return stamp, source, win
 
 
-def prepare_final(prereg_path: Path, *, stamp_confirmed: date | None = None, results_dir: Path | None = None) -> Path:
+def prepare_final(
+    prereg_path: Path, *, stamp_confirmed: date | None = None, results_dir: Path | None = None, explorer=None,
+) -> Path:
     """``python -m judge open-final``: every Final gate check, then write the
     marker and stop. Loads no data. The kind (final or final_alone) follows
     from the candidate's Test window. The window's data need not exist yet.
-    A Final-alone candidate (no Test) also needs its reproduction pass."""
+    A Final-alone candidate (no Test) also needs its reproduction pass. Both
+    kinds re-check the announcement (stamp.check_announcement, including the
+    post's time). Last, the .ots proof must be confirmed in Bitcoin, on the
+    stamp_confirmed date and near the post (check_final_proof; this asks the
+    explorer)."""
+    started = stamps._now_utc()
     path = Path(prereg_path).resolve()
     prereg = load_prereg(path)
     check_integrity(path)
@@ -894,9 +942,11 @@ def prepare_final(prereg_path: Path, *, stamp_confirmed: date | None = None, res
         raise PreregMismatch(f"judge code runs from {Path(CODE_ROOT).resolve()} but {path.name} is in {root}")
     rd = Path(results_dir) if results_dir is not None else root / "results"
     kind = "final_alone" if is_final_alone(prereg) else "final"
-    _, _, win = _final_context(path, prereg, kind, stamp_confirmed, latest_data_date=date.max)
+    stamp, _, win = _final_context(path, prereg, kind, stamp_confirmed, latest_data_date=date.max)
     if kind == "final_alone":
         check_repro_pass(root, rd, prereg)
+    ann = stamps.check_announcement(path, committed_sha256(path), now=started)
+    check_final_proof(path, stamp, stamps.parse_utc(ann["post_time_utc"]), explorer)
     return open_final(
         prereg["candidate_id"], prereg_sha256=committed_sha256(path), judge_tree_hash=_git(root, "rev-parse", "HEAD:judge"),
         window=win, final_alone=kind == "final_alone", results_dir=rd,
@@ -1098,13 +1148,18 @@ def run(
     stamp_confirmed: date | None = None,
     cache_dir: Path | None = None,
     results_dir: Path | None = None,
+    explorer=None,
 ) -> Path:
     """Judge one candidate on one window and write results/{id}-{kind}.json.
 
     Order: prereg integrity, kind checks, window, the reproduction gate (test
-    and final_alone: check_repro_pass), manifest inputs that can fail,
-    then (Final only) check_final_opened, which needs the marker written by
-    ``open-final`` and committed, and only then the data load. The result file
+    and final_alone: check_repro_pass), the announcement gate (every kind:
+    stamp.check_announcement, with the post's time before the run's start),
+    the .ots proof (test: committed, stamps the prereg, a pending attestation
+    is enough; final kinds: check_final_proof, confirmed in Bitcoin on the
+    stamp_confirmed date and near the post, via ``explorer``), manifest inputs that can fail, then (Final only)
+    check_final_opened, which needs the marker written by ``open-final`` and
+    committed, and only then the data load. The result file
     is written for passes and failures, and never overwritten. Costs, threshold,
     gross cap, sims and universe size are the judge's JUDGING constants (the
     prereg must state the same values). stamp_confirmed is the
@@ -1112,6 +1167,7 @@ def run(
     """
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
+    started = stamps._now_utc()
     path = Path(prereg_path).resolve()
     prereg = load_prereg(path)
     check_integrity(path)
@@ -1133,6 +1189,13 @@ def run(
     # relies on the Test pass, which already needed this).
     repro = check_repro_pass(root, results_dir, prereg) if kind in ("test", "final_alone") else None
     prereg_sha = committed_sha256(path)
+    # Every kind judges only rules whose sha256 was posted publicly first,
+    # between registration and this run; the entry never changed.
+    announcement = stamps.check_announcement(path, prereg_sha, now=started)
+    if kind in FINAL_KINDS:
+        ots = check_final_proof(path, stamp, stamps.parse_utc(announcement["post_time_utc"]), explorer)
+    else:
+        ots = stamps.check_ots(path, require_bitcoin=False)
     tree_hash = _git(root, "rev-parse", "HEAD:judge")
     git_head = _git(root, "rev-parse", "HEAD")
     freeze = _pip_freeze()
@@ -1178,6 +1241,14 @@ def run(
     )
     strat = window_slice(net_returns(start_flat(weights, win), changed, close, funding, cost, threshold), win)
     bench = benchmark_returns(close, funding, universe, cost, excluded=excluded, window=win)
+    # Report only (no effect on the verdict); raises GrossExposureError, a
+    # judge bug, if executed gross exposure ever exceeds the gross cap.
+    diag = diagnostics.strategy_diagnostics(
+        start_flat(weights, win), close, funding, cost, win, strat, gross_cap=gross_cap,
+        member=_universe_mask(close.index, list(close.columns), universe),
+        excluded=_excluded_mask(close.index, list(close.columns), excluded),
+        rebalance_threshold=threshold, changed=changed, bench=bench,
+    )
     models = observed_path_models(close, universe, excluded, lookbacks, long_short, win)
     flips, probs = sim_path_args(models, long_short)
     odds = luck_odds(
@@ -1198,6 +1269,7 @@ def run(
         "scored_days": int(len(strat)),
         "total_return": _total_return(strat),
         "bench_total_return": _total_return(bench),
+        "diagnostics": diag,
         "manifest": {
             "prereg_file": path.relative_to(root).as_posix(),
             "prereg_sha256": prereg_sha,
@@ -1211,6 +1283,8 @@ def run(
             "stamp_source": stamp_source,
             "final_marker": final_marker,
             "repro": repro,
+            "ots": ots,
+            "announcement": announcement,
             "results_git_status": results_status,
             "market": MARKET,
             "data_loaded": {"start": load_start.isoformat(), "end": win[1].isoformat()},
