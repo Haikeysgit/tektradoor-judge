@@ -3,7 +3,7 @@ import hashlib
 import json
 import os
 import subprocess
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -136,18 +136,38 @@ def _ots_path(p: Path) -> Path:
     return p.with_name(p.name + ".ots")
 
 
-def _announce(repo: Path, cid: str, sha: str, url: str | None = None, commit: bool = True) -> Path:
+# The default post time of a test announcement. It is on or after the
+# 2026-11-01 floor, after the 2026-10-20 commits, before the patched "now"
+# (NOW_UTC), and within [block - 48 h, block + 7 days] of the STAMP block
+# (2026-10-25 12:00 UTC), as the Final rule needs.
+POST_TIME = datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)
+NOW_UTC = datetime(2027, 3, 1, 12, 0, tzinfo=timezone.utc)  # the run's start time in tests (TODAY)
+
+
+def status_id(when: datetime, seq: int = 0) -> int:
+    """An X/Twitter snowflake status id created at ``when`` (low bits: seq)."""
+    ms = int(when.timestamp() * 1000)
+    return ((ms - S.SNOWFLAKE_EPOCH_MS) << 22) + seq
+
+
+def status_url(when: datetime = POST_TIME, seq: int = 0, user: str = "tektradoor") -> str:
+    return f"https://x.com/{user}/status/{status_id(when, seq)}"
+
+
+def _announce(repo: Path, cid: str, sha: str, url: str | None = None, commit: bool = True,
+              post: datetime = POST_TIME, when: str = COMMIT_DATE) -> Path:
     """Add (or overwrite) the announced.json entry for cid; commit."""
     ann = repo / "prereg" / "announced.json"
     cur = json.loads(ann.read_text()) if ann.exists() else {}
-    cur[cid] = {"sha256": sha, "url": url if url is not None else f"https://x.com/tektradoor/status/{1_000_000 + len(cur)}"}
+    cur[cid] = {"sha256": sha, "url": url if url is not None else status_url(post, seq=len(cur))}
     _write_bytes(ann, json.dumps(cur, indent=2, sort_keys=True) + "\n")
     if commit:
-        _commit(repo, f"announce {cid}")
+        _commit(repo, f"announce {cid}", when=when)
     return ann
 
 
-def _register(repo: Path, name: str = NAME, *, stamp_ots: bool = True, announce: bool = True, **over) -> Path:
+def _register(repo: Path, name: str = NAME, *, stamp_ots: bool = True, announce: bool = True,
+              when: str = COMMIT_DATE, **over) -> Path:
     """Write prereg/NN-name.json (+ .sha256, + a pending .json.ots) for the
     committed judge tree; commit. Then (announce) add its announced.json entry
     in a second commit, as the registration steps say."""
@@ -158,9 +178,9 @@ def _register(repo: Path, name: str = NAME, *, stamp_ots: bool = True, announce:
     _write_bytes(p.with_suffix(".sha256"), f"{sha}  {p.name}\n")
     if stamp_ots:
         _write_bytes(_ots_path(p), ots_bytes(bytes.fromhex(sha)))
-    _commit(repo, "register")
+    _commit(repo, "register", when=when)
     if announce:
-        _announce(repo, p.stem, sha)
+        _announce(repo, p.stem, sha, when=when)
     return p
 
 
@@ -263,6 +283,7 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setattr(J, "_today_utc", lambda: TODAY)
     fake = FakeExplorer()
     monkeypatch.setattr(S, "default_explorer", lambda: fake)  # never the network in tests
+    monkeypatch.setattr(S, "_now_utc", lambda: NOW_UTC)  # the run's start time
     return root
 
 

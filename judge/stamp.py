@@ -9,7 +9,9 @@ merkle root the proof commits to at that height must equal the block's.
 check_announcement: prereg/announced.json maps candidate_id to the sha256
 and the public post (x.com or twitter.com status URL) that announced it. An
 entry, once committed, never changes: every version of the file in git
-history must hold the same value for it.
+history must hold the same value for it. The post's time is decoded offline
+from the status id (a Twitter snowflake) and must lie between the prereg's
+registration and the run. Final binds the Bitcoin stamp to that post time.
 
 ots_status: each prereg's proof state, for ``python -m judge ots-status``.
 
@@ -21,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from opentimestamps.core.notary import BitcoinBlockHeaderAttestation, PendingAttestation
@@ -36,6 +38,19 @@ ANNOUNCED_FILE = "announced.json"
 ANNOUNCE_URL_RE = re.compile(r"https://(x|twitter)\.com/[A-Za-z0-9_]+/status/[0-9]+")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
+# X/Twitter status ids are snowflakes: ms since this epoch, shifted left 22 bits.
+SNOWFLAKE_EPOCH_MS = 1288834974657
+# A post announcing a prereg cannot be older than this (Task 9a ruling I1).
+ANNOUNCE_FLOOR = datetime(2026, 11, 1, tzinfo=timezone.utc)
+# Slack for the prereg's first commit date (a weak, local git claim).
+POST_COMMIT_SLACK = timedelta(days=1)
+# Final: the earliest Bitcoin block of the stamp must lie in
+# [post_time - STAMP_BEFORE_POST, post_time + STAMP_AFTER_POST].
+STAMP_BEFORE_POST = timedelta(days=7)
+STAMP_AFTER_POST = timedelta(hours=48)
+# Bitcoin's proof-of-work limit (the target of nBits 0x1d00ffff).
+POW_LIMIT = 0xFFFF << 208
+
 
 def _J():
     from judge import judge as J
@@ -47,7 +62,40 @@ def _utc_iso(ts: int) -> str:
 
 
 def _now_utc() -> datetime:
+    """Now (UTC): the run's start time for the announcement check, and ots-status's clock. Tests replace this."""
     return datetime.now(timezone.utc)
+
+
+def snowflake_time(status_id: int) -> datetime:
+    """Creation time (UTC) of an X/Twitter status id: (id >> 22) + 1288834974657 ms."""
+    ms = (int(status_id) >> 22) + SNOWFLAKE_EPOCH_MS
+    return datetime.fromtimestamp(ms // 1000, tz=timezone.utc) + timedelta(milliseconds=ms % 1000)
+
+
+def utc_ms_iso(t: datetime) -> str:
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
+
+
+def parse_utc(text: str) -> datetime:
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def bits_target(bits: int) -> int:
+    """The proof-of-work target encoded in a header's nBits (compact form)."""
+    exponent, mantissa = bits >> 24, bits & 0x007FFFFF
+    if bits & 0x00800000:
+        raise ValueError(f"nBits {bits:#010x} has the sign bit set")
+    return mantissa >> (8 * (3 - exponent)) if exponent <= 3 else mantissa << (8 * (exponent - 3))
+
+
+def header_pow_ok(header: bytes) -> bool:
+    """The 80-byte header's double sha256 (as a little-endian number) is at
+    most its nBits target, and that target is at most Bitcoin's limit."""
+    try:
+        target = bits_target(int.from_bytes(header[72:76], "little"))
+    except ValueError:
+        return False
+    return 0 < target <= POW_LIMIT and int.from_bytes(_sha256d(header), "little") <= target
 
 
 def ots_path(prereg_path: Path) -> Path:
@@ -115,6 +163,12 @@ class BlockstreamExplorer:
         if hashed != block_hash:
             raise J.StampError(
                 f"block explorer's header for height {height} does not hash to block {block_hash} (it hashes to {hashed})"
+            )
+        if not header_pow_ok(header):
+            raise J.StampError(
+                f"block explorer's header for height {height} (block {block_hash}) fails proof of work: "
+                f"its hash is above the target in nBits {int.from_bytes(header[72:76], 'little'):#010x}, "
+                "or that target is above Bitcoin's limit"
             )
         return {
             "height": int(height),
@@ -264,7 +318,7 @@ def _parse_announced(blob: bytes, where: str) -> dict:
     return obj
 
 
-def check_announcement(prereg_path: Path, prereg_sha256: str) -> dict:
+def check_announcement(prereg_path: Path, prereg_sha256: str, *, now: datetime | None = None) -> dict:
     """The candidate's committed, never-changed entry in prereg/announced.json.
 
     Refuses (AnnouncementError) unless:
@@ -275,9 +329,15 @@ def check_announcement(prereg_path: Path, prereg_sha256: str) -> dict:
       * url matches ^https://(x|twitter)\\.com/[A-Za-z0-9_]+/status/[0-9]+$;
       * every version of the file in any commit that touched it (all refs)
         either lacks the entry or holds exactly this value. Changing an entry
-        and changing it back is still refused.
-    Returns {"file", "sha256", "url", "commit"}; commit is the oldest commit
-    holding the entry.
+        and changing it back is still refused;
+      * the post time (decoded from the status id, see snowflake_time) is
+        (c) on or after ANNOUNCE_FLOOR (2026-11-01), (a) on or after the
+        prereg's first commit date minus one day, and (b) before ``now``,
+        the run's start (default: the current time);
+      * the prereg's .json.ots was in the tree of the oldest commit holding
+        the entry: a proof existed when the hash was announced.
+    Returns {"file", "sha256", "url", "commit", "post_time_utc"}; commit is
+    the oldest commit holding the entry.
     """
     J = _J()
     path = Path(prereg_path).resolve()
@@ -321,7 +381,52 @@ def check_announcement(prereg_path: Path, prereg_sha256: str) -> dict:
         holding.append(commit)
     if not holding:
         raise J.AnnouncementError(f"{rel}: no commit in history holds the entry for {cid}")
-    return {"file": rel, "sha256": entry["sha256"], "url": entry["url"], "commit": holding[-1]}
+    first_commit = holding[-1]
+
+    post = snowflake_time(int(entry["url"].rsplit("/", 1)[1]))
+    if post < ANNOUNCE_FLOOR:
+        raise J.AnnouncementError(
+            f"{rel}: {cid}'s post {entry['url']} was created {utc_ms_iso(post)}, before "
+            f"{ANNOUNCE_FLOOR.date()}: it cannot be this prereg's announcement"
+        )
+    registered = J.prereg_first_commit_date(path)
+    if post.date() < registered - POST_COMMIT_SLACK:
+        raise J.AnnouncementError(
+            f"{rel}: {cid}'s post was created {utc_ms_iso(post)}, more than a day before the prereg's "
+            f"first commit ({registered}): a hash cannot be announced before its rules were registered"
+        )
+    now = now if now is not None else _now_utc()
+    if post >= now:
+        raise J.AnnouncementError(
+            f"{rel}: {cid}'s post was created {utc_ms_iso(post)}, after the run's start ({utc_ms_iso(now)})"
+        )
+    ots_rel = ots_path(path).relative_to(root).as_posix()
+    if J._git_run(root, "cat-file", "-e", f"{first_commit}:{ots_rel}").returncode != 0:
+        raise J.AnnouncementError(
+            f"{rel}: {cid} was first announced in commit {first_commit[:12]}, which has no {ots_rel}: "
+            "the .ots proof must be committed no later than the announcement"
+        )
+    return {"file": rel, "sha256": entry["sha256"], "url": entry["url"], "commit": first_commit,
+            "post_time_utc": utc_ms_iso(post)}
+
+
+def check_stamp_near_post(info: dict, post_time: datetime) -> None:
+    """Final: the earliest verified Bitcoin block of the stamp lies in
+    [post_time - 7 days, post_time + 48 h]. A proof stamped again later (to
+    move the Final window) lands outside it."""
+    J = _J()
+    block = parse_utc(info["block_time_utc"])
+    if block < post_time - STAMP_BEFORE_POST:
+        raise J.StampError(
+            f"{info['file']}: the earliest Bitcoin attestation (block {info['block_height']}, {info['block_time_utc']}) "
+            f"is more than 7 days before the announcement post ({utc_ms_iso(post_time)})"
+        )
+    if block > post_time + STAMP_AFTER_POST:
+        raise J.StampError(
+            f"{info['file']}: the earliest Bitcoin attestation (block {info['block_height']}, {info['block_time_utc']}) "
+            f"is more than 48 h after the announcement post ({utc_ms_iso(post_time)}): the proof was stamped "
+            "again after the announcement, or confirmed too late"
+        )
 
 
 # ---------------------------------------------------------------- ots-status
@@ -392,7 +497,7 @@ def format_status(rows: list[dict], fail_pending_hours: float | None) -> str:
     for r in rows:
         age = f"{r['age_hours']:.1f}h" if r["age_hours"] is not None else "uncommitted"
         if r["state"] == "bitcoin":
-            what = f"heights {','.join(map(str, r['bitcoin_heights']))} (not checked against an explorer here)"
+            what = f"heights {','.join(map(str, r['bitcoin_heights']))}"
         elif r["state"] == "pending":
             what = f"calendars {', '.join(r['pending_calendars'])}"
         elif r["state"] == "missing":
@@ -400,5 +505,6 @@ def format_status(rows: list[dict], fail_pending_hours: float | None) -> str:
         else:
             what = r["detail"]
         flag = f"  STALE: pending over {fail_pending_hours:g}h" if r["stale"] else ""
-        out.append(f"{r['prereg']}  {r['state']}  age {age}  {what}{flag}")
+        state = "bitcoin (unverified, run open-final to verify)" if r["state"] == "bitcoin" else r["state"]
+        out.append(f"{r['prereg']}  {state}  age {age}  {what}{flag}")
     return "\n".join(out)

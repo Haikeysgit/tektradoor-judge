@@ -731,11 +731,14 @@ def check_stamp_file(prereg_path: Path, final_start: date) -> None:
         )
 
 
-def check_final_proof(prereg_path: Path, stamp_confirmed: date, explorer=None) -> dict:
+def check_final_proof(prereg_path: Path, stamp_confirmed: date, post_time: datetime, explorer=None) -> dict:
     """Final's stamp proof: the .ots has a Bitcoin attestation that matches its
-    block at the explorer (stamp.check_ots, require_bitcoin=True), and the
+    block at the explorer (stamp.check_ots, require_bitcoin=True); the
     committed stamp_confirmed equals the UTC date of the earliest attested
-    block's header time. Returns the ots info for the manifest."""
+    block's header time; and that block lies within [post_time - 7 days,
+    post_time + 48 h] of the announcement post (stamp.check_stamp_near_post),
+    so a proof stamped again later cannot move the Final window. Returns the
+    ots info for the manifest."""
     info = stamps.check_ots(prereg_path, require_bitcoin=True, explorer=explorer)
     block_day = date.fromisoformat(info["block_time_utc"][:10])
     if stamp_confirmed != block_day:
@@ -744,6 +747,7 @@ def check_final_proof(prereg_path: Path, stamp_confirmed: date, explorer=None) -
             f"{side} says {stamp_confirmed}, but the earliest Bitcoin attestation is block "
             f"{info['block_height']} at {info['block_time_utc']} (UTC date {block_day}); they must be equal"
         )
+    stamps.check_stamp_near_post(info, post_time)
     return info
 
 
@@ -912,9 +916,12 @@ def prepare_final(
     """``python -m judge open-final``: every Final gate check, then write the
     marker and stop. Loads no data. The kind (final or final_alone) follows
     from the candidate's Test window. The window's data need not exist yet.
-    A Final-alone candidate (no Test) also needs its reproduction pass and
-    its announcement. Last, the .ots proof must be confirmed in Bitcoin, on
-    the stamp_confirmed date (check_final_proof; this asks the explorer)."""
+    A Final-alone candidate (no Test) also needs its reproduction pass. Both
+    kinds re-check the announcement (stamp.check_announcement, including the
+    post's time). Last, the .ots proof must be confirmed in Bitcoin, on the
+    stamp_confirmed date and near the post (check_final_proof; this asks the
+    explorer)."""
+    started = stamps._now_utc()
     path = Path(prereg_path).resolve()
     prereg = load_prereg(path)
     check_integrity(path)
@@ -926,8 +933,8 @@ def prepare_final(
     stamp, _, win = _final_context(path, prereg, kind, stamp_confirmed, latest_data_date=date.max)
     if kind == "final_alone":
         check_repro_pass(root, rd, prereg)
-        stamps.check_announcement(path, committed_sha256(path))
-    check_final_proof(path, stamp, explorer)
+    ann = stamps.check_announcement(path, committed_sha256(path), now=started)
+    check_final_proof(path, stamp, stamps.parse_utc(ann["post_time_utc"]), explorer)
     return open_final(
         prereg["candidate_id"], prereg_sha256=committed_sha256(path), judge_tree_hash=_git(root, "rev-parse", "HEAD:judge"),
         window=win, final_alone=kind == "final_alone", results_dir=rd,
@@ -1134,11 +1141,11 @@ def run(
     """Judge one candidate on one window and write results/{id}-{kind}.json.
 
     Order: prereg integrity, kind checks, window, the reproduction gate (test
-    and final_alone: check_repro_pass), the announcement gate (test and
-    final_alone: stamp.check_announcement), the .ots proof (test: committed,
-    stamps the prereg, a pending attestation is enough; final kinds:
-    check_final_proof, confirmed in Bitcoin on the stamp_confirmed date, via
-    ``explorer``), manifest inputs that can fail, then (Final only)
+    and final_alone: check_repro_pass), the announcement gate (every kind:
+    stamp.check_announcement, with the post's time before the run's start),
+    the .ots proof (test: committed, stamps the prereg, a pending attestation
+    is enough; final kinds: check_final_proof, confirmed in Bitcoin on the
+    stamp_confirmed date and near the post, via ``explorer``), manifest inputs that can fail, then (Final only)
     check_final_opened, which needs the marker written by ``open-final`` and
     committed, and only then the data load. The result file
     is written for passes and failures, and never overwritten. Costs, threshold,
@@ -1148,6 +1155,7 @@ def run(
     """
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
+    started = stamps._now_utc()
     path = Path(prereg_path).resolve()
     prereg = load_prereg(path)
     check_integrity(path)
@@ -1169,11 +1177,11 @@ def run(
     # relies on the Test pass, which already needed this).
     repro = check_repro_pass(root, results_dir, prereg) if kind in ("test", "final_alone") else None
     prereg_sha = committed_sha256(path)
-    # Test (and Final-alone) judge only rules whose sha256 was posted publicly
-    # first (Final relies on the Test pass, which already needed this).
-    announcement = stamps.check_announcement(path, prereg_sha) if kind in ("test", "final_alone") else None
+    # Every kind judges only rules whose sha256 was posted publicly first,
+    # between registration and this run; the entry never changed.
+    announcement = stamps.check_announcement(path, prereg_sha, now=started)
     if kind in FINAL_KINDS:
-        ots = check_final_proof(path, stamp, explorer)
+        ots = check_final_proof(path, stamp, stamps.parse_utc(announcement["post_time_utc"]), explorer)
     else:
         ots = stamps.check_ots(path, require_bitcoin=False)
     tree_hash = _git(root, "rev-parse", "HEAD:judge")

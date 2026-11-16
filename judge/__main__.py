@@ -26,11 +26,13 @@ file prereg/NN-name.stamp_confirmed (one ISO date line, one commit).
 --stamp-confirmed may only confirm it: a flag without the file, or one that
 disagrees with it, is refused.
 
-Test (and Final-alone) also need the prereg's committed .json.ots proof (a
-pending calendar attestation is enough for Test) and its committed, never
-edited entry in prereg/announced.json. Final needs the proof confirmed in a
-Bitcoin block whose UTC date equals stamp_confirmed (checked against the
-block's raw header from blockstream.info).
+Every run also needs the prereg's committed .json.ots proof (a pending
+calendar attestation is enough for Test) and its committed, never edited
+entry in prereg/announced.json, whose post time (decoded from the status id)
+lies between registration and the run. Final needs the proof confirmed in a
+Bitcoin block whose UTC date equals stamp_confirmed and whose time is within
+7 days before to 48 h after the post (checked against the block's raw header
+from blockstream.info, proof of work included).
 
 ots-status prints each prereg's proof state (missing, invalid,
 digest-mismatch, pending, bitcoin). Exit 1 if any proof is missing, invalid

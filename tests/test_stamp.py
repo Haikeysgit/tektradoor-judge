@@ -1,7 +1,7 @@
 """Task 9a: OpenTimestamps proof check, announcement gate, ots-status."""
 import hashlib
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -14,7 +14,7 @@ from judge import judge as J
 from judge import stamp as S
 from judge.__main__ import main as cli_main
 from test_prereg import (  # noqa: F401
-    CALENDAR, FINAL_WIN, NAME, STAMP, FakeExplorer, _announce, _block_height, _commit, _commit_repro_pass,
+    CALENDAR, FINAL_WIN, NAME, NOW_UTC, POST_TIME, STAMP, FakeExplorer, status_id, status_url, _announce, _block_height, _commit, _commit_repro_pass,
     _commit_test_result, _fake_loader, _git, _noon, _ots_path, _register, _stamp, _upgrade_ots, _write_bytes,
     ots_bytes, repo,
 )
@@ -234,6 +234,21 @@ def test_any_false_bitcoin_attestation_refused(repo):
         S.check_ots(p, require_bitcoin=True)
 
 
+def test_later_false_attestation_refused_even_when_earliest_is_real(repo):
+    # Review M5: verifying only the earliest attestation would pass this proof.
+    p = _register(repo)
+    digest = bytes.fromhex(_sha(p))
+    ex = S.default_explorer()
+    late = date(2026, 10, 28)
+    ots_bytes(digest, bitcoin=[(_block_height(STAMP), _noon(STAMP))], explorer=ex)  # real, earliest
+    ots_bytes(digest, bitcoin=[(_block_height(late), _noon(late))], explorer=ex, wrong_root=True)  # false, later
+    _write_bytes(_ots_path(p), ots_bytes(digest, bitcoin=[(_block_height(STAMP), _noon(STAMP)),
+                                                          (_block_height(late), _noon(late))]))
+    _commit(repo, "later false attestation")
+    with pytest.raises(J.StampError, match=str(_block_height(late))):
+        S.check_ots(p, require_bitcoin=True)
+
+
 # ---------------------------------------------------------------- Final: stamp_confirmed vs block date
 
 def test_stamp_confirmed_must_equal_block_date(repo, monkeypatch):
@@ -271,6 +286,7 @@ def test_final_records_verified_ots_in_manifest(repo, monkeypatch):
     assert m["ots"]["block_time_utc"] == "2026-10-25T12:00:00Z"
     assert m["ots"]["verified"] is True and m["ots"]["explorer"] == "fake://explorer"
     assert m["stamp_confirmed"] == "2026-10-25"
+    assert m["announcement"]["post_time_utc"] == "2026-11-01T01:00:00.000Z"  # review I1 / M1
 
 
 # ---------------------------------------------------------------- announcement gate
@@ -329,9 +345,12 @@ def test_announcement_bad_url_refused(repo, monkeypatch, url):
 
 def test_announcement_good_urls_accepted(repo):
     p = _register(repo, announce=False)
-    for i, url in enumerate(["https://x.com/tektradoor/status/1849", "https://twitter.com/Tek_1/status/1"]):
+    x_url = status_url(POST_TIME)
+    tw_url = f"https://twitter.com/Tek_1/status/{status_id(POST_TIME, seq=5)}"
+    for i, url in enumerate([x_url, tw_url]):
         _announce(repo, NAME if i == 0 else "02-other", _sha(p), url=url)
-    assert S.check_announcement(p, _sha(p))["url"] == "https://x.com/tektradoor/status/1849"
+    ann = S.check_announcement(p, _sha(p))
+    assert ann["url"] == x_url and ann["post_time_utc"] == "2026-11-01T01:00:00.000Z"
 
 
 def test_announcement_entry_edited_in_later_commit_refused(repo, monkeypatch):
@@ -395,7 +414,8 @@ def test_ots_status_reports_each_prereg(repo, monkeypatch, capsys):
     out = capsys.readouterr().out
     lines = {ln.split()[0]: ln for ln in out.splitlines() if ln.strip() and ln.split()[0][:2].isdigit()}
     assert "pending" in lines[p1.stem] and CALENDAR in lines[p1.stem] and "36.0h" in lines[p1.stem]
-    assert "bitcoin" in lines["02-done"] and str(_block_height(STAMP)) in lines["02-done"]
+    assert "bitcoin (unverified, run open-final to verify)" in lines["02-done"]
+    assert str(_block_height(STAMP)) in lines["02-done"]
     assert "missing" in lines["03-unstamped"]
 
 
@@ -437,3 +457,183 @@ def test_ots_workflow_shape():
         assert needle in wf, needle
     for banned in ("contents: write", "git commit", "git push", "git add", "github-actions[bot]"):
         assert banned not in wf, banned
+
+
+# ---------------------------------------------------------------- review I1: the post time (snowflake)
+
+def test_snowflake_post_time_decoded_offline():
+    assert S.snowflake_time(0) == datetime(2010, 11, 4, 1, 42, 54, 657000, tzinfo=timezone.utc)
+    sid = ((1_700_000_000_000 - 1288834974657) << 22) + 12345  # low 22 bits: worker and sequence
+    assert S.snowflake_time(sid) == datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+    assert S.snowflake_time(status_id(POST_TIME, seq=7)) == POST_TIME
+
+
+@pytest.mark.parametrize("post,match", [
+    (datetime(2026, 10, 31, 23, 59, tzinfo=timezone.utc), "2026-11-01"),  # (c) before the floor
+    (NOW_UTC + timedelta(minutes=1), "after the run"),  # (b) not before the run's start
+])
+def test_post_time_floor_and_run_start(repo, monkeypatch, post, match):
+    _no_data(monkeypatch)
+    p = _register(repo, announce=False)
+    _commit_repro_pass(repo, p)
+    _announce(repo, NAME, _sha(p), post=post)
+    with pytest.raises(J.AnnouncementError, match=match):
+        J.run(p, "test")
+
+
+def test_ancient_post_refused(repo, monkeypatch):
+    # Review probe P2: a 2006 post id is well formed but not an announcement.
+    _no_data(monkeypatch)
+    p = _register(repo, announce=False)
+    _commit_repro_pass(repo, p)
+    _announce(repo, NAME, _sha(p), url="https://x.com/jack/status/20")
+    with pytest.raises(J.AnnouncementError, match="2026-11-01"):
+        J.run(p, "test")
+
+
+def test_post_not_before_prereg_first_commit_minus_one_day(repo):
+    # (a) Registered 2026-11-05: a post on 11-04 is allowed (one day of slack
+    # for local git dates), one on 11-03 is refused.
+    when = "2026-11-05T12:00:00+00:00"
+    p = _register(repo, announce=False, when=when)
+    _announce(repo, NAME, _sha(p), post=datetime(2026, 11, 3, 23, 0, tzinfo=timezone.utc), when=when)
+    with pytest.raises(J.AnnouncementError, match="first commit"):
+        S.check_announcement(p, _sha(p))
+    p2 = _register(repo, name="02-ok", candidate_id="02-ok", announce=False, when=when)
+    _announce(repo, "02-ok", _sha(p2), post=datetime(2026, 11, 4, 0, 0, tzinfo=timezone.utc), when=when)
+    assert S.check_announcement(p2, _sha(p2))["post_time_utc"] == "2026-11-04T00:00:00.000Z"
+
+
+def test_ots_must_exist_when_first_announced(repo):
+    # C1: some version of the .ots is committed no later than the commit that
+    # first added the announcement entry.
+    p = _register(repo, stamp_ots=False)
+    _write_bytes(_ots_path(p), ots_bytes(bytes.fromhex(_sha(p))))
+    _commit(repo, "proof added after the announcement")
+    with pytest.raises(J.AnnouncementError, match="ots"):
+        S.check_announcement(p, _sha(p))
+
+
+def test_manifest_records_post_time_for_test(repo, monkeypatch):
+    p = _register(repo)
+    _commit_repro_pass(repo, p)
+    monkeypatch.setattr(J, "_load_data", _fake_loader(drift=0.003, calls=[]))
+    m = json.loads(J.run(p, "test").read_text())["manifest"]
+    assert m["announcement"]["post_time_utc"] == "2026-11-01T01:00:00.000Z"
+
+
+# ---------------------------------------------------------------- review C1: the stamp is bound to the post
+
+def test_restamped_proof_after_announcement_refused(repo, monkeypatch):
+    # Review probe P1: registered with a pending proof, announced, Test passed;
+    # a month later the unchanged prereg is stamped again and committed with a
+    # matching stamp_confirmed, to move the Final window. Its block is far
+    # outside [post - 7 days, post + 48 h], so open-final refuses.
+    _no_data(monkeypatch)
+    p = _register(repo)
+    _commit_test_result(repo, p)
+    restamp = date(2026, 11, 20)
+    digest = bytes.fromhex(_sha(p))
+    _write_bytes(_ots_path(p), ots_bytes(digest, pending=(), bitcoin=[(_block_height(restamp), _noon(restamp))],
+                                         explorer=S.default_explorer()))
+    _write_bytes(p.with_suffix(".stamp_confirmed"), f"{restamp.isoformat()}\n")
+    _commit(repo, "fresh stamp")
+    with pytest.raises(J.StampError, match="48 h"):
+        J.prepare_final(p)
+    assert not (repo / "results" / f"{NAME}.final_opened").exists()
+
+
+def test_block_too_long_before_post_refused(repo, monkeypatch):
+    # The earliest block must be at most 7 days before the post.
+    _no_data(monkeypatch)
+    p = _register(repo, announce=False)
+    _commit_test_result(repo, p)
+    _announce(repo, NAME, _sha(p), post=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))  # block + 8 days
+    _stamp(repo, p)
+    with pytest.raises(J.StampError, match="7 days"):
+        J.prepare_final(p)
+
+
+@pytest.mark.parametrize("block_day", [
+    STAMP,  # block 2026-10-25 12:00 UTC: 6.5 days before the post
+    date(2026, 11, 2),  # block 2026-11-02 12:00 UTC: 36 h after the post
+])
+def test_block_within_post_window_accepted(repo, monkeypatch, block_day):
+    _no_data(monkeypatch)
+    p = _register(repo, announce=False)
+    _commit_test_result(repo, p)
+    _announce(repo, NAME, _sha(p), post=datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc))
+    _stamp(repo, p, day=block_day)  # stamp_confirmed is the block's date
+    assert J.prepare_final(p).exists()
+
+
+def test_bitcoin_block_after_post_plus_48h_refused(repo, monkeypatch):
+    _no_data(monkeypatch)
+    p = _register(repo)  # post 2026-11-01 01:00 UTC
+    _commit_test_result(repo, p)
+    late = date(2026, 11, 3)  # block 2026-11-03 12:00 UTC: post + 59 h
+    _stamp(repo, p, day=late)
+    with pytest.raises(J.StampError, match="48 h"):
+        J.prepare_final(p)
+
+
+# ---------------------------------------------------------------- review M1: Final re-reads the announcement
+
+def test_final_rechecks_announcement(repo, monkeypatch):
+    # Review probe P3: the entry is changed after Test; open-final and run(final) refuse.
+    _no_data(monkeypatch)
+    p = _register(repo)
+    _commit_test_result(repo, p)
+    _stamp(repo, p)
+    _announce(repo, NAME, "e" * 64, url=status_url(POST_TIME, seq=9))
+    with pytest.raises(J.AnnouncementError):
+        J.prepare_final(p)
+    with pytest.raises(J.AnnouncementError):
+        J.run(p, "final")
+
+
+# ---------------------------------------------------------------- review M2: proof of work
+
+def test_bits_target():
+    assert S.bits_target(0x1D00FFFF) == 0xFFFF << 208
+    assert S.bits_target(0x1B0404CB) == 0x0404CB << (8 * (0x1B - 3))
+    with pytest.raises(ValueError):
+        S.bits_target(0x1D80FFFF)  # sign bit set
+
+
+def test_block_170_header_meets_its_target():
+    get, _ = _recorded_get()
+    rec = json.loads((FIXTURES / "block170-explorer.json").read_text())
+    header = bytes.fromhex(next(v for k, v in rec["responses"].items() if k.endswith("/header")))
+    assert S.header_pow_ok(header)
+    assert S.BlockstreamExplorer(get=get).block_at(170)["height"] == 170
+
+
+def _self_consistent_tamper(edit_header):
+    """The recorded explorer, serving an edited header together with the
+    edited header's own hash, so the hash check passes and only proof of work
+    can refuse it."""
+    rec = json.loads((FIXTURES / "block170-explorer.json").read_text())
+    real_hash = rec["responses"]["/block-height/170"]
+    header = bytes.fromhex(rec["responses"][f"/block/{real_hash}/header"])
+    forged = edit_header(header)
+    forged_hash = S._sha256d(forged)[::-1].hex()
+    responses = {"/block-height/170": forged_hash, f"/block/{forged_hash}/header": forged.hex()}
+
+    def get(url, timeout=None):
+        return _Resp(responses[url[len(rec["base"]):]])
+
+    return get
+
+
+@pytest.mark.parametrize("edit", [
+    # another merkle root: the hash no longer meets the target
+    lambda h: h[:36] + hashlib.sha256(b"forged").digest() + h[68:],
+    # nBits lowered to a harder target than the header's work
+    lambda h: h[:72] + (0x1C00FFFF).to_bytes(4, "little") + h[76:],
+    # nBits raised above the proof-of-work limit
+    lambda h: h[:72] + (0x2100FFFF).to_bytes(4, "little") + h[76:],
+])
+def test_header_without_proof_of_work_refused(edit):
+    with pytest.raises(J.StampError, match="proof of work"):
+        S.BlockstreamExplorer(get=_self_consistent_tamper(edit)).block_at(170)
