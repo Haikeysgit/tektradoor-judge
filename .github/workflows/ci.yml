@@ -7,9 +7,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install --require-hashes -r requirements.txt
       - run: python scripts/check_no_secrets.py
+      - run: python scripts/check_attribution.py
+      - if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python scripts/check_attribution.py --pr-body-env PR_BODY
+          python scripts/check_attribution.py --pr-body-env PR_TITLE
       - run: python -m pytest -q

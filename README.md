@@ -81,6 +81,14 @@ pytest -q
 python scripts/check_no_secrets.py
 ```
 
+## Authorship guard
+
+Every commit, PR title and PR description is checked for AI-tool credit lines (co-author trailers, tool names, "generated with" lines); CI fails if any appear. Enable the same check locally once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
