@@ -1,0 +1,10 @@
+#!/bin/sh
+# Blocks commits that credit an AI tool (co-author trailers, tool names,
+# "generated with" lines, or a tool identity). The repo owner is the only author.
+# Enable once per clone:  git config core.hooksPath .githooks
+root=$(git rev-parse --show-toplevel)
+if [ -x "$root/.venv/Scripts/python.exe" ]; then py="$root/.venv/Scripts/python.exe"
+elif [ -x "$root/.venv/bin/python" ]; then py="$root/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then py=python3
+else py=python; fi
+exec "$py" "$root/scripts/check_attribution.py" --message-file "$1"
