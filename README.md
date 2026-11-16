@@ -1,6 +1,6 @@
 # tektradoor-judge
 
-A pre-registered test rig for crypto trading strategies. Each candidate strategy is written down (rules, seed, code version) and timestamped before it is run on out-of-sample data, so the result cannot be tuned after the fact, by anyone including the owner. Costs, funding and a same-universe buy-and-hold benchmark are applied the same way to every candidate.
+An open-source, pre-registered test rig for crypto trading strategies. Each candidate strategy is written down (rules, seed, code version) and timestamped before it is run on out-of-sample data, so the result cannot be tuned after the fact, by anyone including the owner. Costs, funding and a same-universe buy-and-hold benchmark are applied the same way to every candidate.
 
 The repository is public. Before each candidate's Test run, its prereg file is committed here and its sha256 is posted publicly and stamped with OpenTimestamps, so anyone can check the file against the posted hash, the stamp and GitHub's push time. The judge itself refuses to run if that file or the judge code changed after registration.
 
@@ -54,3 +54,7 @@ pip install --require-hashes -r requirements.txt
 pytest -q
 python scripts/check_no_secrets.py
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
