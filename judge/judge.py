@@ -740,8 +740,10 @@ def check_final_proof(prereg_path: Path, stamp_confirmed: date, post_time: datet
     committed stamp_confirmed equals the UTC date of the earliest attested
     block's header time; and that block lies within [post_time - 7 days,
     post_time + 48 h] of the announcement post (stamp.check_stamp_near_post),
-    so a proof stamped again later cannot move the Final window. Returns the
-    ots info for the manifest."""
+    so a proof stamped again later cannot move the Final window; and the post
+    is strictly before the Final window start (stamp_confirmed + 1 day, 00:00
+    UTC), so no Final day is seen before the hash is public. Returns the ots
+    info for the manifest."""
     info = stamps.check_ots(prereg_path, require_bitcoin=True, explorer=explorer)
     block_day = date.fromisoformat(info["block_time_utc"][:10])
     if stamp_confirmed != block_day:
@@ -751,6 +753,13 @@ def check_final_proof(prereg_path: Path, stamp_confirmed: date, post_time: datet
             f"{info['block_height']} at {info['block_time_utc']} (UTC date {block_day}); they must be equal"
         )
     stamps.check_stamp_near_post(info, post_time)
+    final_start = datetime.combine(stamp_confirmed + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    if post_time >= final_start:
+        raise StampError(
+            f"the announcement post ({stamps.utc_ms_iso(post_time)}) is not before the Final window start "
+            f"({final_start.strftime('%Y-%m-%dT%H:%M:%SZ')}, stamp_confirmed {stamp_confirmed} + 1 day): "
+            "the hash must be public before any Final day"
+        )
     return info
 
 

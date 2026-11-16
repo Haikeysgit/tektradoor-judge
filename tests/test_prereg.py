@@ -32,9 +32,9 @@ from judge.judge import (
 
 NAME = "01-demo-long"
 COMMIT_DATE = "2026-10-20T12:00:00+00:00"  # every test commit, so first-commit dates are fixed
-STAMP = date(2026, 10, 25)
-FINAL_WIN = (date(2026, 10, 26), date(2027, 1, 23))
-FINAL_WIN_JSON = {"start": "2026-10-26", "end": "2027-01-23"}
+STAMP = date(2026, 11, 1)  # block at noon UTC, 11 h after POST_TIME; the post precedes the window start
+FINAL_WIN = (date(2026, 11, 2), date(2027, 1, 30))
+FINAL_WIN_JSON = {"start": "2026-11-02", "end": "2027-01-30"}
 TODAY = date(2027, 3, 1)  # Final data for FINAL_WIN exists
 TEST_RUN_UTC = "2026-10-27T10:00:00Z"  # after the stamp: allowed
 
@@ -138,8 +138,9 @@ def _ots_path(p: Path) -> Path:
 
 # The default post time of a test announcement. It is on or after the
 # 2026-11-01 floor, after the 2026-10-20 commits, before the patched "now"
-# (NOW_UTC), and within [block - 48 h, block + 7 days] of the STAMP block
-# (2026-10-25 12:00 UTC), as the Final rule needs.
+# (NOW_UTC), within [block - 48 h, block + 7 days] of the STAMP block
+# (2026-11-01 12:00 UTC), and before the Final window start (2026-11-02
+# 00:00 UTC), as the Final rules need.
 POST_TIME = datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)
 NOW_UTC = datetime(2027, 3, 1, 12, 0, tzinfo=timezone.utc)  # the run's start time in tests (TODAY)
 
@@ -464,8 +465,8 @@ def test_final_needs_stamp_and_full_data():
     # 90 days starting the day after the stamp date.
     assert window("final", pre, STAMP, latest_data_date=TODAY) == FINAL_WIN
     assert window("final_alone", pre, STAMP, latest_data_date=FINAL_WIN[1])[1] == FINAL_WIN[1]
-    with pytest.raises(FinalNotReady, match="2027-01-22"):
-        window("final", pre, STAMP, latest_data_date=date(2027, 1, 22))
+    with pytest.raises(FinalNotReady, match="2027-01-29"):
+        window("final", pre, STAMP, latest_data_date=date(2027, 1, 29))
 
 
 # ---------------------------------------------------------------- stamp_confirmed
@@ -664,7 +665,7 @@ def test_final_resumes_after_crash_with_committed_marker(repo, monkeypatch):
     assert res["kind"] == "final" and res["window"] == FINAL_WIN_JSON
     assert res["scored_days"] == 90
     m = res["manifest"]
-    assert m["stamp_confirmed"] == "2026-10-25" and m["stamp_source"] == "file+flag"
+    assert m["stamp_confirmed"] == STAMP.isoformat() and m["stamp_source"] == "file+flag"
     assert m["final_marker"]["path"] == f"results/{NAME}.final_opened"
     assert len(m["final_marker"]["commit"]) == 40
     # Final result exists: no second run; once committed, never again.

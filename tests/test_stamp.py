@@ -214,7 +214,7 @@ def test_ots_may_be_upgraded_in_later_commits(repo):
 
 def test_earliest_of_several_attestations_is_used(repo):
     p = _register(repo)
-    later = date(2026, 10, 27)
+    later = STAMP + timedelta(days=2)
     _upgrade_ots(p, later, STAMP)
     _commit(repo, "two attestations")
     info = S.check_ots(p, require_bitcoin=True)
@@ -243,7 +243,7 @@ def test_later_false_attestation_refused_even_when_earliest_is_real(repo):
     p = _register(repo)
     digest = bytes.fromhex(_sha(p))
     ex = S.default_explorer()
-    late = date(2026, 10, 28)
+    late = STAMP + timedelta(days=3)
     ots_bytes(digest, bitcoin=[(_block_height(STAMP), _noon(STAMP))], explorer=ex)  # real, earliest
     ots_bytes(digest, bitcoin=[(_block_height(late), _noon(late))], explorer=ex, wrong_root=True)  # false, later
     _write_bytes(_ots_path(p), ots_bytes(digest, bitcoin=[(_block_height(STAMP), _noon(STAMP)),
@@ -259,10 +259,10 @@ def test_stamp_confirmed_must_equal_block_date(repo, monkeypatch):
     _no_data(monkeypatch)
     p = _register(repo)
     _commit_test_result(repo, p)
-    _stamp(repo, p, day=STAMP, block_day=date(2026, 10, 24))
+    _stamp(repo, p, day=STAMP, block_day=STAMP - timedelta(days=1))
     with pytest.raises(J.StampError) as ei:
         J.prepare_final(p)
-    assert "2026-10-24" in str(ei.value) and "2026-10-25" in str(ei.value)
+    assert (STAMP - timedelta(days=1)).isoformat() in str(ei.value) and STAMP.isoformat() in str(ei.value)
     with pytest.raises(J.StampError):
         J.run(p, "final")
     assert not (repo / "results" / f"{NAME}.final_opened").exists()
@@ -287,9 +287,9 @@ def test_final_records_verified_ots_in_manifest(repo, monkeypatch):
     monkeypatch.setattr(J, "_load_data", _fake_loader(drift=0.003, calls=[]))
     m = json.loads(J.run(p, "final").read_text())["manifest"]
     assert m["ots"]["block_height"] == _block_height(STAMP)
-    assert m["ots"]["block_time_utc"] == "2026-10-25T12:00:00Z"
+    assert m["ots"]["block_time_utc"] == f"{STAMP.isoformat()}T12:00:00Z"
     assert m["ots"]["verified"] is True and m["ots"]["explorer"] == "fake://explorer"
-    assert m["stamp_confirmed"] == "2026-10-25"
+    assert m["stamp_confirmed"] == STAMP.isoformat()
     assert m["announcement"]["post_time_utc"] == "2026-11-01T01:00:00.000Z"  # review I1 / M1
 
 
@@ -548,25 +548,27 @@ def test_restamped_proof_after_announcement_refused(repo, monkeypatch):
 
 
 def test_block_too_long_before_post_refused(repo, monkeypatch):
-    # The earliest block must be at most 7 days before the post.
+    # The earliest block must be at most 7 days before the post (checked
+    # before the window-start rule, which this post would also break).
     _no_data(monkeypatch)
     p = _register(repo, announce=False)
     _commit_test_result(repo, p)
     _announce(repo, NAME, _sha(p), post=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))  # block + 8 days
-    _stamp(repo, p)
+    _stamp(repo, p, day=date(2026, 10, 25))
     with pytest.raises(J.StampError, match="7 days"):
         J.prepare_final(p)
 
 
-@pytest.mark.parametrize("block_day", [
-    STAMP,  # block 2026-10-25 12:00 UTC: 6.5 days before the post
-    date(2026, 11, 2),  # block 2026-11-02 12:00 UTC: 36 h after the post
+@pytest.mark.parametrize("block_day,post", [
+    (STAMP, datetime(2026, 11, 1, 20, 0, tzinfo=timezone.utc)),  # block 8 h before the post
+    (STAMP, datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc)),  # block 12 h after the post
+    (date(2026, 11, 2), datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc)),  # block 36 h after the post
 ])
-def test_block_within_post_window_accepted(repo, monkeypatch, block_day):
+def test_block_within_post_window_accepted(repo, monkeypatch, block_day, post):
     _no_data(monkeypatch)
     p = _register(repo, announce=False)
     _commit_test_result(repo, p)
-    _announce(repo, NAME, _sha(p), post=datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc))
+    _announce(repo, NAME, _sha(p), post=post)
     _stamp(repo, p, day=block_day)  # stamp_confirmed is the block's date
     assert J.prepare_final(p).exists()
 
@@ -688,3 +690,39 @@ def test_attestation_below_min_height_refused_for_final(repo):
     with pytest.raises(J.StampError, match="840000"):
         S.check_ots(p, require_bitcoin=True)
     assert ex.calls == []  # refused before asking the explorer
+
+
+
+# ---------------------------------------------------------------- review N1: post before the Final window
+
+def test_final_window_starting_before_the_post_refused(repo, monkeypatch):
+    # Review probe N1: stamped (block) 2026-10-25, posted 2026-11-01 01:00,
+    # so the Final window would start 2026-10-26, six days before the hash
+    # was public. The [post - 7 d, post + 48 h] bound alone allows it.
+    _no_data(monkeypatch)
+    p = _register(repo)  # post 2026-11-01 01:00 UTC
+    _commit_test_result(repo, p)
+    _stamp(repo, p, day=date(2026, 10, 25))
+    with pytest.raises(J.StampError, match="before the Final window start"):
+        J.prepare_final(p)
+    with pytest.raises(J.StampError, match="before the Final window start"):
+        J.run(p, "final")
+    assert not (repo / "results" / f"{NAME}.final_opened").exists()
+
+
+@pytest.mark.parametrize("post,ok", [
+    (datetime(2026, 11, 1, 23, 59, tzinfo=timezone.utc), True),  # a minute before the window start
+    (datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc), False),  # exactly at the start: not strictly before
+    (datetime(2026, 11, 2, 0, 1, tzinfo=timezone.utc), False),  # a minute after the start
+])
+def test_post_must_be_strictly_before_window_start(repo, monkeypatch, post, ok):
+    _no_data(monkeypatch)
+    p = _register(repo, announce=False)
+    _commit_test_result(repo, p)
+    _announce(repo, NAME, _sha(p), post=post)
+    _stamp(repo, p)  # window starts 2026-11-02 00:00 UTC
+    if ok:
+        assert J.prepare_final(p).exists()
+    else:
+        with pytest.raises(J.StampError, match="before the Final window start"):
+            J.prepare_final(p)
