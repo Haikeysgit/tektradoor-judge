@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from judge import data
+from judge import stamp as stamps
 from judge.costs import net_returns
 from judge.metrics import DAYS_PER_YEAR, max_drawdown, sharpe, total_return
 from judge.prices import exchange_daily  # noqa: F401  (the default reproduction loader)
@@ -422,6 +423,14 @@ class ReproGateError(JudgeRefusal):
     """Test (or Final-alone) needs a committed, passing reproduction of the same strategy."""
 
 
+class StampError(JudgeRefusal):
+    """The prereg's .ots proof is missing, uncommitted, for other bytes, or not (yet) good enough."""
+
+
+class AnnouncementError(JudgeRefusal):
+    """Test (or Final-alone) needs the prereg's sha256 publicly announced in prereg/announced.json."""
+
+
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
@@ -722,6 +731,22 @@ def check_stamp_file(prereg_path: Path, final_start: date) -> None:
         )
 
 
+def check_final_proof(prereg_path: Path, stamp_confirmed: date, explorer=None) -> dict:
+    """Final's stamp proof: the .ots has a Bitcoin attestation that matches its
+    block at the explorer (stamp.check_ots, require_bitcoin=True), and the
+    committed stamp_confirmed equals the UTC date of the earliest attested
+    block's header time. Returns the ots info for the manifest."""
+    info = stamps.check_ots(prereg_path, require_bitcoin=True, explorer=explorer)
+    block_day = date.fromisoformat(info["block_time_utc"][:10])
+    if stamp_confirmed != block_day:
+        side = Path(prereg_path).with_suffix(".stamp_confirmed").name
+        raise StampError(
+            f"{side} says {stamp_confirmed}, but the earliest Bitcoin attestation is block "
+            f"{info['block_height']} at {info['block_time_utc']} (UTC date {block_day}); they must be equal"
+        )
+    return info
+
+
 def _window_json(win: Window) -> dict:
     return {"start": win[0].isoformat(), "end": win[1].isoformat()}
 
@@ -881,11 +906,15 @@ def _final_context(path: Path, prereg: dict, kind: Kind, stamp_flag: date | None
     return stamp, source, win
 
 
-def prepare_final(prereg_path: Path, *, stamp_confirmed: date | None = None, results_dir: Path | None = None) -> Path:
+def prepare_final(
+    prereg_path: Path, *, stamp_confirmed: date | None = None, results_dir: Path | None = None, explorer=None,
+) -> Path:
     """``python -m judge open-final``: every Final gate check, then write the
     marker and stop. Loads no data. The kind (final or final_alone) follows
     from the candidate's Test window. The window's data need not exist yet.
-    A Final-alone candidate (no Test) also needs its reproduction pass."""
+    A Final-alone candidate (no Test) also needs its reproduction pass and
+    its announcement. Last, the .ots proof must be confirmed in Bitcoin, on
+    the stamp_confirmed date (check_final_proof; this asks the explorer)."""
     path = Path(prereg_path).resolve()
     prereg = load_prereg(path)
     check_integrity(path)
@@ -894,9 +923,11 @@ def prepare_final(prereg_path: Path, *, stamp_confirmed: date | None = None, res
         raise PreregMismatch(f"judge code runs from {Path(CODE_ROOT).resolve()} but {path.name} is in {root}")
     rd = Path(results_dir) if results_dir is not None else root / "results"
     kind = "final_alone" if is_final_alone(prereg) else "final"
-    _, _, win = _final_context(path, prereg, kind, stamp_confirmed, latest_data_date=date.max)
+    stamp, _, win = _final_context(path, prereg, kind, stamp_confirmed, latest_data_date=date.max)
     if kind == "final_alone":
         check_repro_pass(root, rd, prereg)
+        stamps.check_announcement(path, committed_sha256(path))
+    check_final_proof(path, stamp, explorer)
     return open_final(
         prereg["candidate_id"], prereg_sha256=committed_sha256(path), judge_tree_hash=_git(root, "rev-parse", "HEAD:judge"),
         window=win, final_alone=kind == "final_alone", results_dir=rd,
@@ -1098,13 +1129,18 @@ def run(
     stamp_confirmed: date | None = None,
     cache_dir: Path | None = None,
     results_dir: Path | None = None,
+    explorer=None,
 ) -> Path:
     """Judge one candidate on one window and write results/{id}-{kind}.json.
 
     Order: prereg integrity, kind checks, window, the reproduction gate (test
-    and final_alone: check_repro_pass), manifest inputs that can fail,
-    then (Final only) check_final_opened, which needs the marker written by
-    ``open-final`` and committed, and only then the data load. The result file
+    and final_alone: check_repro_pass), the announcement gate (test and
+    final_alone: stamp.check_announcement), the .ots proof (test: committed,
+    stamps the prereg, a pending attestation is enough; final kinds:
+    check_final_proof, confirmed in Bitcoin on the stamp_confirmed date, via
+    ``explorer``), manifest inputs that can fail, then (Final only)
+    check_final_opened, which needs the marker written by ``open-final`` and
+    committed, and only then the data load. The result file
     is written for passes and failures, and never overwritten. Costs, threshold,
     gross cap, sims and universe size are the judge's JUDGING constants (the
     prereg must state the same values). stamp_confirmed is the
@@ -1133,6 +1169,13 @@ def run(
     # relies on the Test pass, which already needed this).
     repro = check_repro_pass(root, results_dir, prereg) if kind in ("test", "final_alone") else None
     prereg_sha = committed_sha256(path)
+    # Test (and Final-alone) judge only rules whose sha256 was posted publicly
+    # first (Final relies on the Test pass, which already needed this).
+    announcement = stamps.check_announcement(path, prereg_sha) if kind in ("test", "final_alone") else None
+    if kind in FINAL_KINDS:
+        ots = check_final_proof(path, stamp, explorer)
+    else:
+        ots = stamps.check_ots(path, require_bitcoin=False)
     tree_hash = _git(root, "rev-parse", "HEAD:judge")
     git_head = _git(root, "rev-parse", "HEAD")
     freeze = _pip_freeze()
@@ -1211,6 +1254,8 @@ def run(
             "stamp_source": stamp_source,
             "final_marker": final_marker,
             "repro": repro,
+            "ots": ots,
+            "announcement": announcement,
             "results_git_status": results_status,
             "market": MARKET,
             "data_loaded": {"start": load_start.isoformat(), "end": win[1].isoformat()},

@@ -9,7 +9,19 @@ The repository is public. Before each candidate's Test run, its prereg file is c
 ```
 python -m judge reproduce prereg/drafts/01-name.json   # paper reproduction, before registering
 git add results/ && git commit            # commit results/01-name-repro.json
+```
 
+Register, in this order (details in `prereg/README.md`):
+
+1. write `prereg/01-name.json` from its draft, with the real `judge_tree_hash` (`git rev-parse HEAD:judge`);
+2. `sha256sum 01-name.json > 01-name.sha256`;
+3. `ots stamp 01-name.json`;
+4. commit the three files and merge;
+5. post the sha256 publicly on X;
+6. add the entry `{"01-name": {"sha256": "...", "url": "https://x.com/<user>/status/<id>"}}` to `prereg/announced.json` and commit it;
+7. run Test:
+
+```
 python -m judge run prereg/01-name.json --kind test
 git add results/ && git commit            # commit the Test result
 
@@ -31,7 +43,9 @@ git add results/ && git commit            # commit the Final result
 
 A failed reproduction is not tuned: the candidate stops there.
 
-Each run writes `results/{candidate_id}-{kind}.json`, pass or fail, with a manifest (archive checksums, prereg sha256, judge tree hash, seed, `pip freeze`, run time). Results are never overwritten. `results/` is committed: it is the record, so it is deliberately not gitignored.
+Test (and Final-alone) also refuse unless `prereg/announced.json` holds the candidate's entry, committed, with the prereg's sha256 and an `x.com`/`twitter.com` status url, and that entry has the same value in every commit that ever touched the file. Every run needs the committed `prereg/01-name.json.ots` to stamp the committed prereg's sha256; a pending calendar attestation is enough for Test. Final, Final-alone and `open-final` need a Bitcoin attestation, verified against the block's merkle root at blockstream.info, and `01-name.stamp_confirmed` must equal that block's UTC date (the earliest attestation if there are several). A daily workflow (`.github/workflows/ots.yml`) upgrades pending proofs and commits them to main; `python -m judge ots-status` prints each proof's state.
+
+Each run writes `results/{candidate_id}-{kind}.json`, pass or fail, with a manifest (archive checksums, prereg sha256, judge tree hash, seed, `pip freeze`, run time, the `.ots` state and, for Test, the announcement url). Results are never overwritten. `results/` is committed: it is the record, so it is deliberately not gitignored.
 
 Final is two steps. `open-final` runs every Final gate check and writes `results/{id}.final_opened` (prereg sha256, judge tree hash, window); commit it. `run --kind final` loads data only when that marker is committed in exactly one commit and matches. If a Final run fails (network error, Ctrl-C), run it again: the committed marker allows it as long as no Final result exists. Once a Final result has been committed, Final never runs again. See `prereg/README.md` for the files each candidate needs.
 
@@ -43,7 +57,7 @@ The judge's history checks read local git: commit dates, "exactly one commit" an
 - GitHub's push timestamps for the commits;
 - the OpenTimestamps proof (`.ots`) of each prereg, attested in a Bitcoin block.
 
-The judge does not yet verify the `.ots` proof itself (TODO-4).
+The judge verifies the `.ots` proof's Bitcoin attestation against one public explorer (blockstream.info), not against a local node. It trusts that explorer to report the real block at each height; anyone can repeat the check with `ots verify` and their own node. The announcement check confirms that `announced.json` names a well-formed post and never changed in git; it does not fetch the post. Compare the post's time and text against the Test result's commit by hand.
 
 The reproduction gate checks a result file's internal consistency and its committed price data. It does not recompute the Sharpe ratios from that data at Test time. The code tie ensures the same reproduction code would produce them.
 

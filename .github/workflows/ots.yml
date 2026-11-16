@@ -1,0 +1,51 @@
+name: OpenTimestamps
+# Daily: upgrade each prereg's .ots proof from its calendars (pending ->
+# Bitcoin attestation), commit any upgraded proof to main, and fail if a
+# proof is still pending 48 h after it was first committed.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ots-upgrade
+  cancel-in-progress: false
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0 # ots-status ages each proof by its first commit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --require-hashes -r requirements.txt
+      - name: Upgrade proofs (pending is fine)
+        shell: bash
+        run: |
+          shopt -s nullglob
+          proofs=(prereg/*.ots)
+          if [ ${#proofs[@]} -eq 0 ]; then echo "no .ots proofs under prereg/"; exit 0; fi
+          # One file per call: `ots upgrade` exits 1 at the first proof that is
+          # still pending, which would skip the files after it.
+          for f in "${proofs[@]}"; do
+            if ots upgrade "$f"; then echo "$f: complete"; else echo "$f: still pending (exit $?)"; fi
+            rm -f "$f.bak" # ots upgrade keeps the old proof as .bak
+          done
+      - name: Commit upgraded proofs
+        shell: bash
+        run: |
+          git add -- 'prereg/*.ots'
+          if git diff --cached --quiet; then echo "no proof changed"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: upgrade OpenTimestamps proofs"
+          git push origin HEAD:main
+      - name: Fail if a proof is pending over 48 h
+        run: python -m judge ots-status --fail-pending-hours 48

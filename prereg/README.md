@@ -1,6 +1,6 @@
 # Pre-registration files
 
-One candidate = one `NN-name.json` here, registered before its Test run. The judge (`python -m judge run` and `open-final`) refuses to run unless everything below holds. Each file here is committed exactly once and never edited.
+One candidate = one `NN-name.json` here, registered before its Test run. The judge (`python -m judge run` and `open-final`) refuses to run unless everything below holds. The `.json`, `.sha256` and `.stamp_confirmed` files are each committed exactly once and never edited. Two files are exempt from that rule: the `.json.ots` proof, which `ots upgrade` rewrites, and `announced.json`, which gains one entry per candidate.
 
 ## Files per candidate
 
@@ -8,8 +8,9 @@ One candidate = one `NN-name.json` here, registered before its Test run. The jud
 | --- | --- | --- |
 | `NN-name.json` | Every rule value: `candidate_id`, `paper`, `long_short`, `lookbacks`, `vol_target`, `vol_window`, `per_coin_cap_repro`, `gross_cap`, `cost_per_side`, `rebalance_threshold`, `universe_size`, `paper_sample_end`, `seed`, `n_sims`, `judge_tree_hash` | Registration |
 | `NN-name.sha256` | sha256 of the `.json` bytes (`sha256sum` format is fine) | Registration |
-| `NN-name.json.ots` | OpenTimestamps stamp of the `.json` | Registration |
-| `NN-name.stamp_confirmed` | One line: the ISO date (UTC) the stamp was confirmed in a Bitcoin block | Once confirmed, in one commit dated on or before the Final window start; needed for Final |
+| `NN-name.json.ots` | OpenTimestamps proof of the `.json` (`ots stamp`). Recommitted when upgraded (daily workflow) | Registration; upgraded later |
+| `NN-name.stamp_confirmed` | One line: the UTC date of the Bitcoin block that confirms the `.ots` (the earliest Bitcoin attestation's block header time) | Once confirmed, in one commit dated on or before the Final window start; needed for Final |
+| `announced.json` (one file for all candidates) | `{"NN-name": {"sha256": "...", "url": "https://x.com/<user>/status/<id>"}}`: where the sha256 was posted | After the public post, before Test; an entry is never changed |
 
 `judge_tree_hash` is `git rev-parse HEAD:judge` at registration. `candidate_id` must equal the file name without `.json` (`NN-name`).
 
@@ -17,10 +18,17 @@ These values are fixed by the judge and must appear exactly: `cost_per_side` 0.0
 
 ## Registering
 
-1. Commit the judge code. Record `git rev-parse HEAD:judge` as `judge_tree_hash`.
-2. Write `NN-name.json` (LF line endings; the repo's `.gitattributes` forces them, so the sha256 is the same on every OS), then `sha256sum NN-name.json > NN-name.sha256`, then `ots stamp NN-name.json`.
-3. Commit all three and post the sha256 publicly before the Test run.
-4. When the stamp is confirmed, commit `NN-name.stamp_confirmed`.
+In this order:
+
+1. Write `NN-name.json` from its draft in `drafts/`, with the real `judge_tree_hash`: commit the judge code first, then record `git rev-parse HEAD:judge`. Use LF line endings; the repo's `.gitattributes` forces them, so the sha256 is the same on every OS.
+2. `sha256sum NN-name.json > NN-name.sha256`.
+3. `ots stamp NN-name.json` (writes `NN-name.json.ots`, pending at the calendars).
+4. Commit the three files and merge them to main.
+5. Post the sha256 publicly on X.
+6. Add the candidate's entry to `announced.json` (`sha256` and the post's `https://x.com/<user>/status/<id>` url) and commit it.
+7. Run Test: `python -m judge run prereg/NN-name.json --kind test`.
+
+Later, when the daily `ots` workflow has upgraded the proof to a Bitcoin attestation (`python -m judge ots-status` shows `bitcoin`), pull it and commit `NN-name.stamp_confirmed` with that block's UTC date. Final needs both.
 
 ## What the judge checks before running
 
@@ -30,6 +38,8 @@ These values are fixed by the judge and must appear exactly: `cost_per_side` 0.0
 - `judge_tree_hash` equals the current `git rev-parse HEAD:judge`.
 - No uncommitted or untracked changes under `judge/` or `prereg/`.
 - The judge code running is the code in this repo.
+- `NN-name.json.ots` is committed (working bytes equal to HEAD; it may have several commits) and stamps the sha256 of the committed `NN-name.json`. For Test a pending calendar attestation is enough. For Final, Final-alone and `open-final` it needs a Bitcoin block header attestation, and every Bitcoin attestation in it must match its block: the merkle root the proof commits to at that height must equal the block's `merkle_root` at blockstream.info (no local node, no `ots verify`). The manifest records the proof's sha256, its attestations and, for Final, the verified block.
+- Test and Final-alone (`run` and `open-final`): `announced.json` is committed and holds an entry for the candidate with exactly `sha256` (equal to the committed prereg's) and `url` (matching `^https://(x|twitter)\.com/[A-Za-z0-9_]+/status/\d+$`). Every version of `announced.json` in git history (all refs) either lacks that entry or holds the same value: an entry that was ever changed is refused, even if it was changed back. Duplicate keys are refused. The manifest records the url.
 
 Any failure names the file and both hashes. Editing a prereg after registration means a new candidate with a new number, never an edit.
 
@@ -50,6 +60,11 @@ Any failure names the file and both hashes. Editing a prereg after registration 
 Final reads the date only from the committed `NN-name.stamp_confirmed`. `--stamp-confirmed YYYY-MM-DD` can only confirm it: a flag without the file, or one that disagrees with it, is refused. The manifest records `stamp_source` (`file` or `file+flag`). The judge refuses a stamp date unless all of these hold:
 - (a) the Final start (stamp + 1 day) is after the Test window end (2026-10-19);
 - (b) the stamp date is on or after the prereg's first commit date (`git log --all --diff-filter=A --format=%cs`, oldest);
-- (c) the `.stamp_confirmed` file has exactly one commit, dated on or before the Final start, so the window is fixed before its first day and never moved.
+- (c) the `.stamp_confirmed` file has exactly one commit, dated on or before the Final start, so the window is fixed before its first day and never moved;
+- (d) the stamp date equals the UTC date of the block header time of the earliest (lowest height) Bitcoin attestation in the committed `.ots`, verified as above.
 
-These are local git checks; see "Limits" in the top-level README.
+Rules (b) and (c) are local git checks; see "Limits" in the top-level README.
+
+## OpenTimestamps upgrades
+
+`.github/workflows/ots.yml` runs daily (and on demand). It runs `ots upgrade` on each `prereg/*.ots`, tolerating proofs that are still pending, commits any upgraded proof as `github-actions[bot]` (`chore: upgrade OpenTimestamps proofs`) and pushes it to main. It then runs `python -m judge ots-status --fail-pending-hours 48`, which fails the job if a proof is missing, invalid or for other bytes, or still has no Bitcoin attestation 48 hours after the `.ots` was first committed.

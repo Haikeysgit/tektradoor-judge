@@ -4,6 +4,7 @@
     python -m judge open-final prereg/NN-name.json      # Final step 1
     python -m judge run prereg/NN-name.json --kind final|final_alone   # step 2
     python -m judge reproduce prereg/drafts/NN-name.json  # paper reproduction
+    python -m judge ots-status [--fail-pending-hours 48]  # each prereg's .ots state
 
 Final is two steps. ``open-final`` runs every Final gate check, writes
 results/NN-name.final_opened (prereg sha256, judge tree hash, window) and
@@ -24,6 +25,17 @@ stamp_confirmed (needed for Final) comes only from the committed companion
 file prereg/NN-name.stamp_confirmed (one ISO date line, one commit).
 --stamp-confirmed may only confirm it: a flag without the file, or one that
 disagrees with it, is refused.
+
+Test (and Final-alone) also need the prereg's committed .json.ots proof (a
+pending calendar attestation is enough for Test) and its committed, never
+edited entry in prereg/announced.json. Final needs the proof confirmed in a
+Bitcoin block whose UTC date equals stamp_confirmed (checked at
+blockstream.info).
+
+ots-status prints each prereg's proof state (missing, invalid,
+digest-mismatch, pending, bitcoin). Exit 1 if any proof is missing, invalid
+or for other bytes, or (with --fail-pending-hours H) still pending more than
+H hours after the .ots was first committed; else 0.
 """
 from __future__ import annotations
 
@@ -35,6 +47,7 @@ from pathlib import Path
 
 from judge import data
 from judge import judge as J
+from judge import stamp as S
 from judge.judge import KINDS, JudgeRefusal, prepare_final, reproduce, run
 
 DATA_ERRORS = (data.MissingArchiveFile, data.ChecksumMismatch, data.ArchiveFetchError, data.DataIntegrityError)
@@ -68,7 +81,17 @@ def main(argv: list[str] | None = None) -> int:
     rp = sub.add_parser("reproduce", help="reproduce the paper's single-asset Sharpe ratios for a prereg draft")
     rp.add_argument("prereg", type=Path, help="prereg/drafts/NN-name.json")
     rp.add_argument("--cache-dir", type=Path, default=None, help="API response cache (default: <repo>/data_cache/repro)")
+    st = sub.add_parser("ots-status", help="print each prereg's OpenTimestamps proof state")
+    st.add_argument(
+        "--fail-pending-hours", type=float, default=None, metavar="H",
+        help="exit 1 if a proof is still pending H hours after the .ots was first committed",
+    )
     args = parser.parse_args(argv)
+
+    if args.command == "ots-status":
+        rows = S.ots_status(J.CODE_ROOT, fail_pending_hours=args.fail_pending_hours)
+        print(S.format_status(rows, args.fail_pending_hours))
+        return 1 if any(r["problem"] for r in rows) else 0
 
     if args.command == "reproduce":
         try:
