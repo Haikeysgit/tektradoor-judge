@@ -63,7 +63,7 @@ Final reads the date only from the committed `NN-name.stamp_confirmed`. `--stamp
 - (b) the stamp date is on or after the prereg's first commit date (`git log --all --diff-filter=A --format=%cs`, oldest);
 - (c) the `.stamp_confirmed` file has exactly one commit, dated on or before the Final start, so the window is fixed before its first day and never moved;
 - (d) the stamp date equals the UTC date of the block header time of the earliest (lowest height) Bitcoin attestation in the committed `.ots`, verified as above;
-- (e) that block's time is within [post time - 7 days, post time + 48 h] of the announcement post. The `.ots` may be upgraded, but a proof stamped again after the announcement (to move the Final window) lands outside this window and is refused. So run `ots stamp` shortly before posting; calendars usually confirm within hours. The explorer's header must also meet its own proof-of-work target (its hash at most the target in its nBits, and that target at most Bitcoin's limit).
+- (e) that block's time is within [post time - 7 days, post time + 48 h] of the announcement post. The `.ots` may be upgraded, but a proof stamped again after the announcement (to move the Final window) lands outside this window and is refused. So run `ots stamp` shortly before posting; calendars usually confirm within hours. The explorer's header must also meet its own proof-of-work target (its hash at most the target in its nBits, and that target at most Bitcoin's limit). Every Bitcoin attestation must be at height 840000 or later, and there the header's target must be at most the target of difficulty 1e13, so a forged header needs real mining.
 
 Rules (b) and (c) are local git checks; see "Limits" in the top-level README.
 

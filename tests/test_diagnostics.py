@@ -31,15 +31,17 @@ def _closes(path: dict) -> pd.DataFrame:
     return pd.DataFrame(path, index=DAYS, dtype=float)
 
 
-def _diag(weights, close, member=None, excluded=None, gross_cap=1.0, funding=FUND):
+def _diag(weights, close, member=None, excluded=None, gross_cap=1.0, funding=FUND, threshold=None, changed=None):
     coins = list(weights.columns)
+    changed = changed if changed is not None else pd.DataFrame(True, index=DAYS, columns=coins)
     fund = pd.DataFrame(funding, index=DAYS, columns=coins)
     member = member if member is not None else pd.DataFrame(True, index=DAYS, columns=coins)
     excluded = excluded if excluded is not None else pd.DataFrame(False, index=DAYS, columns=coins)
-    net = net_returns(weights, pd.DataFrame(True, index=DAYS, columns=coins), close, fund, CPS, None)
+    net = net_returns(weights, changed, close, fund, CPS, threshold)
     net = J.window_slice(net, WIN)
     diag = D.strategy_diagnostics(
         weights, close, fund, CPS, WIN, net, gross_cap=gross_cap, member=member, excluded=excluded,
+        rebalance_threshold=threshold, changed=changed,
     )
     return diag, net
 
@@ -69,7 +71,10 @@ def test_one_coin_entry_stop_out_and_known_pnl():
     # Every per-coin contribution belongs to a trade: trades sum to the window's daily returns.
     assert diag["reconcile"]["sum_trade_pnl_pct"] == pytest.approx(net.sum() * 100, abs=1e-12)
     assert diag["worst_day"] == {"date": "2025-01-06", "return_pct": pytest.approx(net.min() * 100)}
-    assert diag["leverage"] == {"max_gross_exposure": 0.5, "max_net_exposure": 0.5, "gross_cap": 1.0}
+    assert diag["leverage"] == {
+        "max_target_gross": 0.5, "max_executed_gross": 0.5, "days_executed_above_cap": 0,
+        "max_net_exposure": 0.5, "gross_cap": 1.0, "rebalance_threshold": None,
+    }
 
 
 def test_left_universe_and_exit_flag_classified():
@@ -121,13 +126,44 @@ def test_worst_five_trades_sorted():
     assert diag["worst_trade"] == diag["worst_trades"][0]
 
 
-def test_gross_exposure_above_cap_is_a_judge_bug():
+def test_target_gross_above_cap_is_a_judge_bug():
     flat = [100.0] * 12
     w = _frame({"A": {3: 0.6}, "B": {3: 0.6}})
-    with pytest.raises(D.GrossExposureError, match="1.2"):
+    with pytest.raises(D.GrossExposureError, match="target gross exposure 1.2"):
         _diag(w, _closes({"A": flat, "B": flat}))
     ok = _frame({"A": {3: 0.5}, "B": {3: 0.5 + 1e-12}})
-    assert _diag(ok, _closes({"A": flat, "B": flat}))[0]["leverage"]["max_gross_exposure"] == pytest.approx(1.0)
+    assert _diag(ok, _closes({"A": flat, "B": flat}))[0]["leverage"]["max_target_gross"] == pytest.approx(1.0)
+
+
+# Targets always sum to the cap (1.0), but the rebalance threshold (0.25 here,
+# exact in binary) leaves A and then B unrebalanced while new coins execute:
+#   decision 01-03: A 1.0                     -> executed A 1.0           (1.0)
+#   decision 01-04: A 0.75, B 0.25            -> A stays 1.0 (rel 0.25)   (1.25)
+#   decision 01-05: A 0.75, B 0.1875, C 0.0625 -> B stays 0.25 (rel 0.25) (1.3125)
+DRIFT = {"A": {3: 1.0, 4: 0.75, 5: 0.75}, "B": {4: 0.25, 5: 0.1875}, "C": {5: 0.0625}}
+
+
+def test_executed_drift_from_the_rebalance_rule_is_reported_not_refused():
+    flat = [100.0] * 12
+    w = _frame(DRIFT)
+    changed = pd.DataFrame(False, index=DAYS, columns=list(w.columns))
+    diag, _ = _diag(w, _closes({c: flat for c in "ABC"}), threshold=0.25, changed=changed)
+    lev = diag["leverage"]
+    assert lev["max_target_gross"] == 1.0
+    assert lev["max_executed_gross"] == 1.3125  # above cap x (1 + threshold) = 1.25: legitimate drift
+    assert lev["days_executed_above_cap"] == 2
+    assert lev["max_executed_gross"] <= D.executed_gross_bound(1.0, 0.25)  # cap / (1 - threshold)
+    assert "1.31x actual (drift from the 25% rebalance rule) on 2 days" in "\n".join(D.summary(diag))
+
+
+def test_executed_gross_above_drift_bound_is_a_judge_bug(monkeypatch):
+    flat = [100.0] * 12
+    w = _frame({"A": {3: 0.5}, "B": {3: 0.5}})
+    real = D._executed_weights
+    monkeypatch.setattr(D, "_executed_weights", lambda *a: real(*a) * 1.4)  # an executor bug
+    with pytest.raises(D.GrossExposureError, match="executed gross exposure 1.4"):
+        _diag(w, _closes({"A": flat, "B": flat}), threshold=0.2,
+              changed=pd.DataFrame(True, index=DAYS, columns=["A", "B"]))
 
 
 # ---------------------------------------------------------------- run() and CLI
@@ -151,7 +187,8 @@ def test_run_writes_diagnostics_on_pass_and_fail(repo, monkeypatch, force):
     assert res["passed"] is force
     diag = res["diagnostics"]
     assert set(diag) == KEYS
-    assert diag["leverage"]["max_gross_exposure"] <= 1.0 + 1e-9
+    assert diag["leverage"]["max_target_gross"] <= 1.0 + 1e-9
+    assert diag["leverage"]["max_executed_gross"] <= 1.25 + 1e-9 and diag["leverage"]["rebalance_threshold"] == 0.2
     assert diag["trades"]["n_trades"] > 0
     assert sum(diag["exits"]["reasons"].values()) == diag["trades"]["n_trades"]
     assert diag["benchmark"]["worst_day"]["date"] >= "2025-03-20"
@@ -164,7 +201,7 @@ def test_cli_prints_diagnostics_summary(repo, monkeypatch, capsys):
     assert cli_main(["run", str(p), "--kind", "test"]) == 1
     out = capsys.readouterr().out
     assert "trades" in out and "win rate" in out and "stop-outs" in out
-    assert "worst trade" in out and "worst day" in out and "max gross" in out
+    assert "worst trade" in out and "worst day" in out and "highest exposure" in out and "x target" in out
 
 
 def test_cli_gross_exposure_bug_is_loud_and_writes_nothing(repo, monkeypatch, capsys):

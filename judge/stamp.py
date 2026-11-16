@@ -50,6 +50,12 @@ STAMP_BEFORE_POST = timedelta(days=7)
 STAMP_AFTER_POST = timedelta(hours=48)
 # Bitcoin's proof-of-work limit (the target of nBits 0x1d00ffff).
 POW_LIMIT = 0xFFFF << 208
+# Final attestations must be in blocks at or above this height, and their
+# headers must carry a target at most FLOOR_TARGET (difficulty >= 1e13), so a
+# forged header needs real mining work, not a laptop.
+MIN_ATTESTATION_HEIGHT = 840_000
+FLOOR_DIFFICULTY = 10**13
+FLOOR_TARGET = POW_LIMIT // FLOOR_DIFFICULTY
 
 
 def _J():
@@ -164,6 +170,17 @@ class BlockstreamExplorer:
             raise J.StampError(
                 f"block explorer's header for height {height} does not hash to block {block_hash} (it hashes to {hashed})"
             )
+        bits = int.from_bytes(header[72:76], "little")
+        if int(height) >= MIN_ATTESTATION_HEIGHT:
+            try:
+                easy = bits_target(bits) > FLOOR_TARGET
+            except ValueError:
+                easy = True
+            if easy:
+                raise J.StampError(
+                    f"block explorer's header for height {height} (block {block_hash}) has nBits {bits:#010x}, "
+                    f"a difficulty below the {FLOOR_DIFFICULTY:.0e} floor for heights >= {MIN_ATTESTATION_HEIGHT}"
+                )
         if not header_pow_ok(header):
             raise J.StampError(
                 f"block explorer's header for height {height} (block {block_hash}) fails proof of work: "
@@ -231,7 +248,10 @@ def _verify_bitcoin(height: int, root: bytes, explorer, name: str) -> dict:
     return {"block_height": height, "block_hash": blk.get("hash"), "block_time_utc": _utc_iso(ts)}
 
 
-def verify_proof(blob: bytes, expected_sha256: str, *, require_bitcoin: bool, explorer=None, name: str = "proof") -> dict:
+def verify_proof(
+    blob: bytes, expected_sha256: str, *, require_bitcoin: bool, explorer=None, name: str = "proof",
+    min_height: int | None = MIN_ATTESTATION_HEIGHT,
+) -> dict:
     """Check a .ots proof's bytes against the sha256 it must stamp.
 
     The proof must be a sha256 detached proof of ``expected_sha256``.
@@ -240,7 +260,9 @@ def verify_proof(blob: bytes, expected_sha256: str, *, require_bitcoin: bool, ex
     require_bitcoin=True: at least one Bitcoin attestation, and every one must
     match its block's merkle root at the explorer (a proof with a false claim
     is refused). The earliest (lowest height) gives block_height and
-    block_time_utc (the header time, UTC).
+    block_time_utc (the header time, UTC). Every Bitcoin attestation must be
+    at height >= min_height (MIN_ATTESTATION_HEIGHT; None turns the floor
+    off, for tests of old real blocks only), checked before any lookup.
     """
     J = _J()
     dtf = parse_proof(blob, name)
@@ -270,6 +292,12 @@ def verify_proof(blob: bytes, expected_sha256: str, *, require_bitcoin: bool, ex
             f"{name} has no Bitcoin attestation yet (pending at {', '.join(pending)}); "
             "once the calendars have one (the daily ots workflow posts a notice), run `ots upgrade` "
             "locally and commit the upgraded proof through a PR"
+        )
+    low = sorted({h for h, _ in bitcoin if min_height is not None and h < min_height})
+    if low:
+        raise J.StampError(
+            f"{name} has Bitcoin attestation(s) at height {', '.join(map(str, low))}, below {min_height}: "
+            "Final needs attestations in modern blocks"
         )
     explorer = explorer if explorer is not None else default_explorer()
     checked = [_verify_bitcoin(h, root, explorer, name) for h, root in bitcoin]

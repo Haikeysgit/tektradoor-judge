@@ -24,6 +24,16 @@ Exit reason, read on the exit decision day:
     trailing_stop  otherwise: the coin's combo signal went to zero (or
                    changed sign);
     window_end     still open at the end of the window.
+
+Exposure. Target weights are capped at gross_cap by the allocation; a
+target day above gross_cap + 1e-9 is a judge bug. Executed weights may drift
+above the cap: the published 20% rebalance rule (costs.py) leaves a position
+alone while its target moves by at most the threshold, so a stale position
+can sit at up to 1 / (1 - threshold) of its target while new positions enter
+at their (capped) targets. Executed gross is therefore at most
+gross_cap / (1 - threshold) (1.25x at 20%); above that is a judge bug. The
+report gives both maxima and the number of days executed gross is above the
+cap.
 """
 from __future__ import annotations
 
@@ -39,13 +49,28 @@ UNITS = {
     "pnl": "percent of portfolio: sum of the trade's daily contributions (weight x coin return, "
            "minus that coin's costs and funding); not compounded",
     "holding_days": "return days from the entry decision to the exit decision",
-    "exposure": "sum of |executed weights| (gross) and |sum of executed weights| (net), multiples of equity",
+    "exposure": "multiples of equity: target gross = sum |target weights|; executed gross = sum |executed "
+                "weights| (what returns are earned on); net = |sum of executed weights|",
     "worst_day": "percent net portfolio return on that return day",
 }
 
 
 class GrossExposureError(AssertionError):
-    """A judge bug: executed gross exposure above the gross cap."""
+    """A judge bug: target gross above the cap, or executed gross above the drift bound."""
+
+
+def executed_gross_bound(gross_cap: float, rebalance_threshold: float | None) -> float:
+    """The most executed gross exposure the rebalance rule can produce from
+    targets capped at gross_cap: gross_cap / (1 - threshold).
+
+    A position is left alone while |target - current| / |current| <= threshold,
+    so |current| <= |target| / (1 - threshold); new and rebalanced positions
+    sit at their targets. (gross_cap * (1 + threshold) is not a bound: 1.0 ->
+    0.75 with threshold 0.25 is a 25% move of the 1.0 position and stays.)
+    """
+    if not rebalance_threshold:
+        return gross_cap
+    return gross_cap / (1.0 - rebalance_threshold)
 
 
 def _iso(ts) -> str:
@@ -90,7 +115,8 @@ def strategy_diagnostics(
     weights exactly as costs.net_returns does. net: the window's net daily
     returns (for the worst day and the reconciliation). member / excluded:
     universe membership and exit-check exclusions by decision day.
-    Raises GrossExposureError when executed gross exposure exceeds gross_cap.
+    Raises GrossExposureError (a judge bug) when target gross exceeds
+    gross_cap, or executed gross exceeds executed_gross_bound.
     """
     idx, cols = weights.index, list(weights.columns)
     if rebalance_threshold is not None:
@@ -110,14 +136,23 @@ def strategy_diagnostics(
     W, P = w.loc[in_win].to_numpy(), prev.loc[in_win].to_numpy()
     H, T = hold.loc[in_win].to_numpy(), turn.loc[in_win].to_numpy()
 
+    target_w = weights.fillna(0.0).loc[in_win].to_numpy()
+    tgross = np.abs(target_w).sum(axis=1) if len(days) else np.zeros(1)
     gross = np.abs(W).sum(axis=1) if len(days) else np.zeros(1)
     net_exp = np.abs(W.sum(axis=1)) if len(days) else np.zeros(1)
-    max_gross, max_net = float(gross.max()), float(net_exp.max())
-    if max_gross > gross_cap + GROSS_TOLERANCE:
-        at = _iso(days[int(gross.argmax())])
+    max_target, max_gross, max_net = float(tgross.max()), float(gross.max()), float(net_exp.max())
+    if max_target > gross_cap + GROSS_TOLERANCE:
         raise GrossExposureError(
-            f"judge bug: executed gross exposure {max_gross:.10g} on {at} exceeds gross_cap {gross_cap}"
+            f"judge bug: target gross exposure {max_target:.10g} on {_iso(days[int(tgross.argmax())])} "
+            f"exceeds gross_cap {gross_cap}"
         )
+    bound = executed_gross_bound(gross_cap, rebalance_threshold)
+    if max_gross > bound + GROSS_TOLERANCE:
+        raise GrossExposureError(
+            f"judge bug: executed gross exposure {max_gross:.10g} on {_iso(days[int(gross.argmax())])} exceeds "
+            f"{bound:.10g}, the most the rebalance rule allows (gross_cap {gross_cap} / (1 - {rebalance_threshold}))"
+        )
+    days_above = int((gross > gross_cap + GROSS_TOLERANCE).sum()) if len(days) else 0
 
     delisted = (close.notna().cummax() & close.isna()).cummax()
     mem = _mask(member, days, cols, True)
@@ -184,7 +219,14 @@ def strategy_diagnostics(
         "worst_trade": worst[0] if worst else None,
         "worst_trades": worst,
         "worst_day": worst_day(net),
-        "leverage": {"max_gross_exposure": max_gross, "max_net_exposure": max_net, "gross_cap": gross_cap},
+        "leverage": {
+            "max_target_gross": max_target,
+            "max_executed_gross": max_gross,
+            "days_executed_above_cap": days_above,
+            "max_net_exposure": max_net,
+            "gross_cap": gross_cap,
+            "rebalance_threshold": rebalance_threshold,
+        },
         "reconcile": {"sum_trade_pnl_pct": float(sum(pnls)), "sum_daily_return_pct": float(net.sum() * 100)},
         "units": UNITS,
         "benchmark": {"worst_day": worst_day(bench)} if bench is not None else None,
@@ -213,6 +255,9 @@ def summary(diag: dict) -> list[str]:
                    if wt else "none")
     worst_day_s = f"{wd['date']} {pct(wd['return_pct'])}" if wd else "n/a"
     lines.append(f"worst trade: {worst_trade}; worst day {worst_day_s}")
-    lines.append(f"leverage: max gross {lev['max_gross_exposure']:.3f}, max net {lev['max_net_exposure']:.3f} "
-                 f"(cap {lev['gross_cap']})")
+    exposure = f"highest exposure: {lev['max_target_gross']:.2f}x target, {lev['max_executed_gross']:.2f}x actual"
+    if lev["days_executed_above_cap"]:
+        thr = lev["rebalance_threshold"] or 0.0
+        exposure += f" (drift from the {thr:.0%} rebalance rule) on {lev['days_executed_above_cap']} days"
+    lines.append(f"{exposure}; cap {lev['gross_cap']:g}x; highest net {lev['max_net_exposure']:.2f}x")
     return lines

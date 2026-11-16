@@ -43,8 +43,8 @@ class _Resp:
         return self._payload
 
 
-def _recorded_get():
-    rec = json.loads((FIXTURES / "block170-explorer.json").read_text())
+def _recorded_get(name: str = "block170-explorer.json"):
+    rec = json.loads((FIXTURES / name).read_text())
     calls = []
 
     def get(url, timeout=None):
@@ -65,7 +65,10 @@ def test_real_block_170_proof_verifies_through_blockstream_explorer():
     blob = (FIXTURES / "block170-tx.bin.ots").read_bytes()
     get, calls = _recorded_get()
     explorer = S.BlockstreamExplorer(get=get)
-    info = S.verify_proof(blob, hashlib.sha256(tx).hexdigest(), require_bitcoin=True, explorer=explorer, name="block170")
+    # min_height=None: block 170 is far below the Final floor; this test pins
+    # only the parse, hash and merkle logic.
+    info = S.verify_proof(blob, hashlib.sha256(tx).hexdigest(), require_bitcoin=True, explorer=explorer,
+                          name="block170", min_height=None)
     assert info["block_height"] == 170
     assert info["block_hash"] == "00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee"
     assert info["block_time_utc"] == "2009-01-12T03:30:25Z"
@@ -110,7 +113,8 @@ def test_unreversed_merkle_root_is_refused():
     ex = FakeExplorer()
     ex.blocks[170] = {"height": 170, "hash": "00" * 32, "merkle_root": bytes.fromhex(root)[::-1].hex(), "timestamp": 1231731025}
     with pytest.raises(J.StampError, match="merkle"):
-        S.verify_proof(blob, hashlib.sha256(tx).hexdigest(), require_bitcoin=True, explorer=ex, name="block170")
+        S.verify_proof(blob, hashlib.sha256(tx).hexdigest(), require_bitcoin=True, explorer=ex, name="block170",
+                       min_height=None)
 
 
 def _tampered(edit):
@@ -637,3 +641,50 @@ def _self_consistent_tamper(edit_header):
 def test_header_without_proof_of_work_refused(edit):
     with pytest.raises(J.StampError, match="proof of work"):
         S.BlockstreamExplorer(get=_self_consistent_tamper(edit)).block_at(170)
+
+
+
+# ---------------------------------------------------------------- ruling: proof-of-work floor for Final
+
+def test_difficulty_floor_target():
+    assert S.MIN_ATTESTATION_HEIGHT == 840_000
+    assert S.FLOOR_TARGET == S.POW_LIMIT // 10**13  # the target at difficulty 1e13
+
+
+def test_real_block_840000_header_meets_the_floor():
+    get, calls = _recorded_get("block840000-explorer.json")
+    ref = json.loads((FIXTURES / "block840000-explorer.json").read_text())["reference_block_json"]
+    blk = S.BlockstreamExplorer(get=get).block_at(840_000)
+    assert blk["hash"] == ref["id"] and blk["merkle_root"] == ref["merkle_root"] and blk["timestamp"] == ref["timestamp"]
+    header = bytes.fromhex(blk["header"])
+    assert int.from_bytes(header[72:76], "little") == ref["bits"]
+    assert S.bits_target(ref["bits"]) <= S.FLOOR_TARGET
+
+
+def test_forged_easy_header_at_real_height_refused():
+    # Block 840000's real header with nBits set to difficulty 1, served with
+    # its own hash: hash and merkle checks pass, but the target is far above
+    # the floor for a modern height (forging it needs no real mining).
+    rec = json.loads((FIXTURES / "block840000-explorer.json").read_text())
+    real_hash = rec["responses"]["/block-height/840000"]
+    header = bytearray.fromhex(rec["responses"][f"/block/{real_hash}/header"])
+    header[72:76] = (0x1D00FFFF).to_bytes(4, "little")
+    forged_hash = S._sha256d(bytes(header))[::-1].hex()
+    responses = {"/block-height/840000": forged_hash, f"/block/{forged_hash}/header": header.hex()}
+
+    def get(url, timeout=None):
+        return _Resp(responses[url[len(rec["base"]):]])
+
+    with pytest.raises(J.StampError, match="difficulty"):
+        S.BlockstreamExplorer(get=get).block_at(840_000)
+
+
+def test_attestation_below_min_height_refused_for_final(repo):
+    p = _register(repo)
+    digest = bytes.fromhex(_sha(p))
+    ex = S.default_explorer()
+    _write_bytes(_ots_path(p), ots_bytes(digest, bitcoin=[(839_999, _noon(STAMP))], explorer=ex))
+    _commit(repo, "old-height attestation")
+    with pytest.raises(J.StampError, match="840000"):
+        S.check_ots(p, require_bitcoin=True)
+    assert ex.calls == []  # refused before asking the explorer
