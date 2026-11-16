@@ -72,8 +72,20 @@ def test_real_block_170_proof_verifies_through_blockstream_explorer():
     assert info["verified"] is True and info["bitcoin_heights"] == [170] and info["pending_calendars"] == []
     assert calls == [
         "https://blockstream.info/api/block-height/170",
-        "https://blockstream.info/api/block/00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee",
+        "https://blockstream.info/api/block/00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee/header",
     ]
+
+
+def test_block_170_header_fields_match_the_explorer_json():
+    # The merkle root and time come from the 80 header bytes; the explorer's
+    # own JSON (recorded for reference only) agrees with them.
+    get, _ = _recorded_get()
+    blk = S.BlockstreamExplorer(get=get).block_at(170)
+    ref = json.loads((FIXTURES / "block170-explorer.json").read_text())["reference_block_json"]
+    assert blk["hash"] == ref["id"]
+    assert blk["merkle_root"] == ref["merkle_root"]  # display order, reversed from the header bytes
+    assert blk["timestamp"] == ref["timestamp"] == 1231731025
+    assert blk["height"] == 170
 
 
 def test_real_block_170_fixture_is_the_documented_merkle_path():
@@ -101,17 +113,31 @@ def test_unreversed_merkle_root_is_refused():
         S.verify_proof(blob, hashlib.sha256(tx).hexdigest(), require_bitcoin=True, explorer=ex, name="block170")
 
 
-def test_blockstream_explorer_refuses_inconsistent_answers():
+def _tampered(edit):
+    """The recorded explorer, with the header response passed through edit(hex)."""
     get, _ = _recorded_get()
 
-    def wrong_height(url, timeout=None):
+    def tampered(url, timeout=None):
         r = get(url, timeout)
-        if isinstance(r._payload, dict):
-            r = _Resp({**r._payload, "height": 171})
-        return r
+        return _Resp(edit(r.text)) if url.endswith("/header") else r
 
-    with pytest.raises(J.StampError, match="height"):
-        S.BlockstreamExplorer(get=wrong_height).block_at(170)
+    return tampered
+
+
+def test_blockstream_explorer_refuses_header_not_hashing_to_block_hash():
+    # A header whose merkle root was swapped no longer hashes to the block hash.
+    other_root = hashlib.sha256(b"other").digest().hex()
+    with pytest.raises(J.StampError, match="does not hash to"):
+        S.BlockstreamExplorer(get=_tampered(lambda h: h[:72] + other_root + h[136:])).block_at(170)
+    # So does a header with its time moved.
+    with pytest.raises(J.StampError, match="does not hash to"):
+        S.BlockstreamExplorer(get=_tampered(lambda h: h[:136] + "00000000" + h[144:])).block_at(170)
+
+
+@pytest.mark.parametrize("edit", [lambda h: h[:-2], lambda h: h + "00", lambda h: "zz" + h[2:], lambda h: ""])
+def test_blockstream_explorer_refuses_malformed_header(edit):
+    with pytest.raises(J.StampError, match="80-byte header"):
+        S.BlockstreamExplorer(get=_tampered(edit)).block_at(170)
 
     def http_error(url, timeout=None):
         r = _Resp("not found")
@@ -402,9 +428,12 @@ def test_ots_status_with_no_preregs(repo, capsys):
 # ---------------------------------------------------------------- workflow
 
 def test_ots_workflow_shape():
+    # Status only: the founder is the only author, so the workflow never
+    # commits or pushes. Upgrades are tried on a scratch copy and reported.
     wf = (REPO_ROOT / ".github" / "workflows" / "ots.yml").read_text()
-    for needle in ("schedule:", "cron:", "workflow_dispatch:", "contents: write", "fetch-depth: 0",
+    for needle in ("schedule:", "cron:", "workflow_dispatch:", "contents: read", "fetch-depth: 0",
                    'python-version: "3.11"', "pip install --require-hashes -r requirements.txt",
-                   "ots upgrade", "github-actions[bot]", "chore: upgrade OpenTimestamps proofs",
-                   "python -m judge ots-status --fail-pending-hours 48"):
+                   "ots upgrade", "RUNNER_TEMP", "::notice", "python -m judge ots-status --fail-pending-hours 48"):
         assert needle in wf, needle
+    for banned in ("contents: write", "git commit", "git push", "git add", "github-actions[bot]"):
+        assert banned not in wf, banned

@@ -58,14 +58,25 @@ def ots_path(prereg_path: Path) -> Path:
 
 # ---------------------------------------------------------------- explorer
 
+HEADER_RE = re.compile(r"[0-9a-f]{160}")  # 80 bytes, hex
+
+
+def _sha256d(b: bytes) -> bytes:
+    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
+
 class BlockstreamExplorer:
     """Block lookups by height from the Blockstream Esplora API.
 
-    block_at(h): GET /block-height/{h} gives the block hash; GET /block/{hash}
-    gives its JSON, whose merkle_root is hex in display byte order (the
-    reverse of the header's internal order) and timestamp is the header time
-    (unix seconds). ``get`` is injectable (requests.get by default) so tests
-    stay offline.
+    block_at(h): GET /block-height/{h} gives the block hash; GET
+    /block/{hash}/header gives the raw 80-byte header (hex). The header must
+    hash to that block hash (double sha256, reversed to display order), so
+    the explorer cannot hand back fields that disagree with the block it
+    names. The merkle root (bytes 36..68, internal order) and time (bytes
+    68..72, little-endian unix seconds) are read from the header bytes, not
+    from the explorer's JSON. The trust left in the explorer is only that
+    the hash it gives for height h is the main chain's block at h.
+    ``get`` is injectable (requests.get by default) so tests stay offline.
     """
 
     def __init__(self, base: str = BLOCKSTREAM_API, get=None, timeout: float = 30.0):
@@ -89,22 +100,29 @@ class BlockstreamExplorer:
         return resp
 
     def block_at(self, height: int) -> dict:
+        """{height, hash, merkle_root (hex, display order), timestamp (unix), header (hex)}."""
         J = _J()
         block_hash = self._get(f"/block-height/{int(height)}").text.strip()
         if not SHA256_RE.fullmatch(block_hash):
             raise J.StampError(f"block explorer gave no block hash for height {height}: {block_hash[:80]!r}")
-        try:
-            blk = self._get(f"/block/{block_hash}").json()
-        except ValueError as exc:
-            raise J.StampError(f"block explorer gave invalid JSON for block {block_hash}: {exc}") from exc
-        if not isinstance(blk, dict) or blk.get("id") != block_hash or blk.get("height") != int(height):
+        header_hex = self._get(f"/block/{block_hash}/header").text.strip()
+        if not HEADER_RE.fullmatch(header_hex):
             raise J.StampError(
-                f"block explorer answers disagree for height {height}: block {block_hash} reports "
-                f"id {blk.get('id') if isinstance(blk, dict) else None!r}, "
-                f"height {blk.get('height') if isinstance(blk, dict) else None!r}"
+                f"block explorer gave no 80-byte header for block {block_hash} (height {height}): {header_hex[:200]!r}"
             )
-        return {"height": blk["height"], "hash": block_hash, "merkle_root": blk.get("merkle_root"),
-                "timestamp": blk.get("timestamp")}
+        header = bytes.fromhex(header_hex)
+        hashed = _sha256d(header)[::-1].hex()
+        if hashed != block_hash:
+            raise J.StampError(
+                f"block explorer's header for height {height} does not hash to block {block_hash} (it hashes to {hashed})"
+            )
+        return {
+            "height": int(height),
+            "hash": block_hash,
+            "merkle_root": header[36:68][::-1].hex(),
+            "timestamp": int.from_bytes(header[68:72], "little"),
+            "header": header_hex,
+        }
 
 
 def default_explorer() -> BlockstreamExplorer:
@@ -196,7 +214,8 @@ def verify_proof(blob: bytes, expected_sha256: str, *, require_bitcoin: bool, ex
     if not bitcoin:
         raise J.StampError(
             f"{name} has no Bitcoin attestation yet (pending at {', '.join(pending)}); "
-            "wait for `ots upgrade` (the daily ots workflow) and pull the upgraded proof"
+            "once the calendars have one (the daily ots workflow posts a notice), run `ots upgrade` "
+            "locally and commit the upgraded proof through a PR"
         )
     explorer = explorer if explorer is not None else default_explorer()
     checked = [_verify_bitcoin(h, root, explorer, name) for h, root in bitcoin]

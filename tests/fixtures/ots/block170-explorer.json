@@ -1,22 +1,23 @@
 {
-  "_note": "Recorded from blockstream.info on 2026-11-16 (GET /api/block-height/170 and /api/block/{hash}). block170-tx.bin is the raw bytes of tx f4184fc5...9e16 (block 170, index 1); block170-tx.bin.ots is a proof built from it: sha256(file) -> sha256 (txid) -> prepend coinbase txid -> sha256 -> sha256 (merkle root) -> BitcoinBlockHeaderAttestation(170). Constructed, not calendar-issued; the block and its merkle root are real.",
+  "_note": "Recorded from blockstream.info (GET /api/block-height/170 and /api/block/{hash}/header, 2026-11-16). The judge reads the merkle root and time from the 80-byte header and checks that its double-sha256 (reversed) is the block hash. reference_block_json is /api/block/{hash}, kept only to cross-check the header-derived values. block170-tx.bin is the raw bytes of tx f4184fc5...9e16 (block 170, index 1); block170-tx.bin.ots is a proof built from it: sha256(file) -> sha256 (txid) -> prepend coinbase txid -> sha256 -> sha256 (merkle root) -> BitcoinBlockHeaderAttestation(170). Constructed, not calendar-issued; the block and its merkle root are real.",
   "base": "https://blockstream.info/api",
   "responses": {
     "/block-height/170": "00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee",
-    "/block/00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee": {
-      "id": "00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee",
-      "height": 170,
-      "version": 1,
-      "timestamp": 1231731025,
-      "tx_count": 2,
-      "size": 490,
-      "weight": 1960,
-      "merkle_root": "7dac2c5666815c17a3b36427de37bb9d2e2c5ccec3f8633eb91a4205cb4c10ff",
-      "previousblockhash": "000000002a22cfee1f2c846adbd12b3e183d4f97683f85dad08a79780a84bd55",
-      "mediantime": 1231716245,
-      "nonce": 1889418792,
-      "bits": 486604799,
-      "difficulty": 1.0
-    }
+    "/block/00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee/header": "0100000055bd840a78798ad0da853f68974f3d183e2bd1db6a842c1feecf222a00000000ff104ccb05421ab93e63f8c3ce5c2c2e9dbb37de2764b3a3175c8166562cac7d51b96a49ffff001d283e9e70"
+  },
+  "reference_block_json": {
+    "id": "00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee",
+    "height": 170,
+    "version": 1,
+    "timestamp": 1231731025,
+    "tx_count": 2,
+    "size": 490,
+    "weight": 1960,
+    "merkle_root": "7dac2c5666815c17a3b36427de37bb9d2e2c5ccec3f8633eb91a4205cb4c10ff",
+    "previousblockhash": "000000002a22cfee1f2c846adbd12b3e183d4f97683f85dad08a79780a84bd55",
+    "mediantime": 1231716245,
+    "nonce": 1889418792,
+    "bits": 486604799,
+    "difficulty": 1.0
   }
 }

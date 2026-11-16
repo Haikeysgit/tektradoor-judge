@@ -29,8 +29,8 @@ disagrees with it, is refused.
 Test (and Final-alone) also need the prereg's committed .json.ots proof (a
 pending calendar attestation is enough for Test) and its committed, never
 edited entry in prereg/announced.json. Final needs the proof confirmed in a
-Bitcoin block whose UTC date equals stamp_confirmed (checked at
-blockstream.info).
+Bitcoin block whose UTC date equals stamp_confirmed (checked against the
+block's raw header from blockstream.info).
 
 ots-status prints each prereg's proof state (missing, invalid,
 digest-mismatch, pending, bitcoin). Exit 1 if any proof is missing, invalid
