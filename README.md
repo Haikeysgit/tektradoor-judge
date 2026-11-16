@@ -47,6 +47,14 @@ Every run (Test, Final, Final-alone, and `open-final`) also refuses unless `prer
 
 Each run writes `results/{candidate_id}-{kind}.json`, pass or fail, with a manifest (archive checksums, prereg sha256, judge tree hash, seed, `pip freeze`, run time, the `.ots` state, and the announcement url and post time). Results are never overwritten. `results/` is committed: it is the record, so it is deliberately not gitignored.
 
+Every result file also has `diagnostics` (`judge/diagnostics.py`). They are report only and never change pass or fail.
+- **Trades.** A trade is one coin's position episode in the executed weights, from entry to the return to zero; in long-short a sign flip starts a new trade. The section gives the count, win rate, average win and loss, and holding days. P&L is the trade's summed contribution to portfolio return, net of that coin's costs and funding, in percent of the portfolio.
+- **Exit reasons.** Each exit is a trailing stop, leaving the universe, an exit flag or the window end. The section counts them and gives the stop-out share and cost.
+- **Worst cases.** The worst trade, the 5 worst trades, and the worst day for the strategy and the benchmark.
+- **Leverage.** Max gross and net exposure.
+
+If executed gross exposure ever exceeds the gross cap, the run stops as a judge bug (exit code 4) and writes no result. `python -m judge run` prints a short summary of the diagnostics after the verdict.
+
 Final is two steps. `open-final` runs every Final gate check and writes `results/{id}.final_opened` (prereg sha256, judge tree hash, window); commit it. `run --kind final` loads data only when that marker is committed in exactly one commit and matches. If a Final run fails (network error, Ctrl-C), run it again: the committed marker allows it as long as no Final result exists. Once a Final result has been committed, Final never runs again. See `prereg/README.md` for the files each candidate needs.
 
 ## Limits

@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from judge import data
+from judge import diagnostics
 from judge import stamp as stamps
 from judge.costs import net_returns
 from judge.metrics import DAYS_PER_YEAR, max_drawdown, sharpe, total_return
@@ -59,6 +60,8 @@ from judge.strategies.donchian import (
     VOL_WINDOW,
     _allocation_frame,
     _apply_allocation,
+    _excluded_mask,
+    _universe_mask,
     allocate,
     portfolio_weights,
     signal,
@@ -1229,6 +1232,14 @@ def run(
     )
     strat = window_slice(net_returns(start_flat(weights, win), changed, close, funding, cost, threshold), win)
     bench = benchmark_returns(close, funding, universe, cost, excluded=excluded, window=win)
+    # Report only (no effect on the verdict); raises GrossExposureError, a
+    # judge bug, if executed gross exposure ever exceeds the gross cap.
+    diag = diagnostics.strategy_diagnostics(
+        start_flat(weights, win), close, funding, cost, win, strat, gross_cap=gross_cap,
+        member=_universe_mask(close.index, list(close.columns), universe),
+        excluded=_excluded_mask(close.index, list(close.columns), excluded),
+        rebalance_threshold=threshold, changed=changed, bench=bench,
+    )
     models = observed_path_models(close, universe, excluded, lookbacks, long_short, win)
     flips, probs = sim_path_args(models, long_short)
     odds = luck_odds(
@@ -1249,6 +1260,7 @@ def run(
         "scored_days": int(len(strat)),
         "total_return": _total_return(strat),
         "bench_total_return": _total_return(bench),
+        "diagnostics": diag,
         "manifest": {
             "prereg_file": path.relative_to(root).as_posix(),
             "prereg_sha256": prereg_sha,

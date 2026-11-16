@@ -14,7 +14,8 @@ before it loads any Final data. A failed Final run can simply be rerun.
 
 Exit codes for run: 0 the run completed and passed, 1 it completed and did not
 pass (the result file is written either way), 2 the judge refused (integrity,
-window, Final gate, existing result), 3 a data error. open-final: 0 marker
+window, Final gate, existing result), 3 a data error, 4 a judge bug (executed
+gross exposure above the gross cap; no result is written). open-final: 0 marker
 written, 2 refused. reproduce: 0 every check passed, 1 completed and failed
 (the result file is written either way), 2 refused, 3 a data error.
 
@@ -48,6 +49,7 @@ from datetime import date
 from pathlib import Path
 
 from judge import data
+from judge import diagnostics
 from judge import judge as J
 from judge import stamp as S
 from judge.judge import KINDS, JudgeRefusal, prepare_final, reproduce, run
@@ -132,6 +134,9 @@ def main(argv: list[str] | None = None) -> int:
     except JudgeRefusal as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
+    except diagnostics.GrossExposureError as exc:
+        print(f"JUDGE BUG, no result written: {exc}", file=sys.stderr)
+        return 4
     except DATA_ERRORS as exc:
         print(f"data error: {exc}", file=sys.stderr)
         return 3
@@ -142,6 +147,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{res['window']['start']}..{res['window']['end']}: sharpe {v['sharpe']:.3f}, "
         f"max_dd {v['max_dd']:.3f}, bench_sharpe {v['bench_sharpe']:.3f}, luck_odds {res['luck_odds']:.3f}"
     )
+    for line in diagnostics.summary(res["diagnostics"]):
+        print(f"  {line}")
     print(f"wrote {out}")
     return 0 if res["passed"] else 1
 
